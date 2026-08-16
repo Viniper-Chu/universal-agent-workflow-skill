@@ -22,3 +22,9 @@
   as an explicit removal mode, and manual guidance when neither capability is
   available.
 - Added Windows UTF-8 CLI output and one-request/one-release batching.
+- Made contract creation atomic so a rejected actor cannot leave a contract
+  without its authoritative first event.
+- Bound destination-side readiness and handoff events to the contract's exact
+  destination role, including management-to-management transfers.
+- Bound handoff acceptance to the code bundle's exact source session; a
+  destination that names itself as its peer now fails before event write.

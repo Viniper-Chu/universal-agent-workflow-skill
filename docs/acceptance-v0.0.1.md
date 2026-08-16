@@ -1,7 +1,6 @@
 # Acceptance v0.0.1
 
-Status: release candidate until a fresh public repository, tag and real
-management/execution handoff have passed.
+Status: PASS.
 
 The release must prove:
 
@@ -19,3 +18,18 @@ The release must prove:
 - Windows paths containing non-ASCII characters produce valid UTF-8 JSON;
 - a fresh real management task and execution task adopt the exact Skill and
   accept their code-state handoffs before old tasks are archived.
+
+Observed acceptance:
+
+- 21 unit tests, the built-in selftest, install validation, structure
+  validation and public CI passed;
+- all three legacy sources migrated with complete non-blank structured
+  coverage and explicit non-runtime status before their retirement;
+- a fresh management task and one fresh execution task both ran code-backed
+  destination bootstrap and self-contained JSON handoff receive without
+  reading external workflow Markdown;
+- the fresh execution contract entered `executing` with a zero-error audit;
+- real deployment exposed and then verified fixes for atomic task creation,
+  destination-role signing and exact source-peer identity;
+- a self-referential peer was rejected without appending an event, while the
+  exact source management identity was accepted.
