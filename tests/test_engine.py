@@ -48,6 +48,16 @@ class WorkflowEngineTests(unittest.TestCase):
         store.create_contract(contract)
         store.plan("task", contract["plan_steps"])
 
+    def test_invalid_contract_actor_leaves_no_partial_task(self):
+        temp, project, store = self.make_store()
+        self.addCleanup(temp.cleanup)
+        contract = make_contract("atomic-task", "Atomic task", "reject partial creation")
+        with self.assertRaisesRegex(WorkflowError, "event actor is invalid"):
+            store.create_contract(contract, actor="source-management6")
+        self.assertFalse(store._contract_path("atomic-task").exists())
+        self.assertFalse(store._task_state_path("atomic-task").exists())
+        self.assertEqual(store.events("atomic-task"), [])
+
     def receipt(self, destination="destination"):
         return {
             "skillName": SKILL_NAME,

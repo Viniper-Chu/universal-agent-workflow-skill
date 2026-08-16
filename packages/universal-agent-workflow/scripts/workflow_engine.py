@@ -678,6 +678,10 @@ class WorkflowStore:
         path = self._contract_path(contract["task_id"])
         if path.exists():
             raise WorkflowError("task contract already exists")
+        # Validate the first event before persisting the immutable contract.
+        # Otherwise an invalid actor can leave an unrecoverable half-created
+        # task with a contract but no authoritative event stream.
+        _validate_event(_state_from_events([], contract), "contract.created", {}, actor)
         _json_write(path, contract)
         self._append_new(contract["task_id"], actor)
         self.register_artifact(contract["task_id"], path, "contract", self.generation(), canonical=True)
