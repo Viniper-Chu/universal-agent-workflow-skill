@@ -81,10 +81,10 @@ EVENT_ACTOR_ROLES: dict[str, set[str]] = {
     "plan.created": {"management"},
     "migration.authorized": {"management"},
     "bootstrap.requested": {"management"},
-    "destination.ready": {"execution"},
+    "destination.ready": set(ROLES),
     "handoff.requested": {"management"},
-    "handoff.bundle_received": {"execution"},
-    "handoff.accepted": {"execution"},
+    "handoff.bundle_received": set(ROLES),
+    "handoff.accepted": set(ROLES),
     "handoff.completed": {"management"},
     "source-session.removal_requested": {"management"},
     "source-session.removal_blocked": {"management"},
@@ -429,6 +429,10 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
         allowed = EVENT_ACTOR_ROLES.get(event, set())
         if actor not in allowed:
             raise WorkflowError(f"actor {actor} is not allowed for {event}")
+        if event in {"destination.ready", "handoff.bundle_received", "handoff.accepted"}:
+            destination_role = state.get("contract", {}).get("destination_role", "execution")
+            if actor != destination_role:
+                raise WorkflowError(f"actor {actor} does not match destination role {destination_role} for {event}")
     status = state["status"]
     if event == "contract.created":
         if state.get("event_count"):
@@ -492,6 +496,8 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
             raise WorkflowError("handoff acceptance requires a code-consumed bundle receipt")
         if not payload.get("peer_identity") or not payload.get("role"):
             raise WorkflowError("handoff acceptance requires role and peer identity")
+        if payload.get("role") != state.get("contract", {}).get("destination_role", "execution"):
+            raise WorkflowError("handoff acceptance role does not match the contract destination role")
         return
     if event == "handoff.completed":
         if status not in {"destination_ready", "handoff_pending"} or not state.get("destination_ready") or not state.get("handoff_accepted"):

@@ -58,6 +58,47 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertFalse(store._task_state_path("atomic-task").exists())
         self.assertEqual(store.events("atomic-task"), [])
 
+    def test_destination_events_are_signed_by_contract_destination_role(self):
+        temp, project, store = self.make_store()
+        self.addCleanup(temp.cleanup)
+        contract = make_contract("management-handoff", "Management handoff", "transfer management")
+        contract["destination_role"] = "management"
+        store.create_contract(contract)
+        store.plan("management-handoff", contract["plan_steps"])
+        store.bootstrap("management-handoff", "management", "management-7", "source-management", "installed", "native")
+        receipt = self.receipt("management-7")
+        receipt["role"] = "management"
+        with self.assertRaisesRegex(WorkflowError, "does not match destination role"):
+            store.destination_ready("management-handoff", receipt, "management", "management-7", actor="execution")
+        snapshot = store.destination_ready("management-handoff", receipt, "management", "management-7", actor="management")
+        self.assertEqual(snapshot["status"], "destination_ready")
+
+    def test_handoff_acceptance_role_must_match_contract_destination(self):
+        temp, project, store = self.make_store()
+        self.addCleanup(temp.cleanup)
+        contract = make_contract("execution-handoff", "Execution handoff", "transfer execution")
+        store.create_contract(contract)
+        store.plan("execution-handoff", contract["plan_steps"])
+        store.bootstrap("execution-handoff", "execution", "execution-7", "management-7", "installed", "native")
+        receipt = self.receipt("execution-7")
+        store.destination_ready("execution-handoff", receipt, "execution", "execution-7")
+        exported = store.export_code_handoff(
+            "execution-handoff",
+            self.continuity(),
+            "source-session",
+            "execution-7",
+            "management",
+            "execution",
+            "management-7",
+            "execution-7",
+            "native",
+        )
+        store.receive_code_handoff("execution-handoff", exported["bundlePath"], "execution-7", "execution")
+        with self.assertRaisesRegex(WorkflowError, "role does not match"):
+            store.handoff_accept("execution-handoff", "management", "management-7")
+        snapshot = store.handoff_accept("execution-handoff", "execution", "management-7")
+        self.assertTrue(snapshot["handoff_accepted"])
+
     def receipt(self, destination="destination"):
         return {
             "skillName": SKILL_NAME,
