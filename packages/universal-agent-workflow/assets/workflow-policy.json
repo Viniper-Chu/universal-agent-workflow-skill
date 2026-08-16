@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "policyName": "universal-agent-workflow-runtime-policy",
+  "policyVersion": "0.0.1",
+  "runtimeAuthority": "code-state",
+  "externalMarkdownRequired": false,
+  "rules": [
+    {
+      "id": "universal-project-scope",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "contract",
+      "text": "Use project-neutral contracts and adapters; keep project-specific facts only in the task continuity payload."
+    },
+    {
+      "id": "code-authority",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "engine",
+      "text": "The event log, validated contract, runtime policy and code handoff bundle are authoritative; external Markdown is never a runtime prerequisite."
+    },
+    {
+      "id": "source-migration-preservation",
+      "appliesTo": ["management"],
+      "enforcement": "source-compiler",
+      "text": "Before retiring legacy workflow sources, preserve every non-blank line as structured local migration evidence and verify the packaged runtime policy."
+    },
+    {
+      "id": "plan-before-dispatch",
+      "appliesTo": ["management"],
+      "enforcement": "state-machine",
+      "text": "Create a bounded plan and contract before dispatching execution."
+    },
+    {
+      "id": "management-user-interface",
+      "appliesTo": ["management"],
+      "enforcement": "router",
+      "text": "Management is the user-facing role and communicates in plain language."
+    },
+    {
+      "id": "execution-management-interface",
+      "appliesTo": ["execution"],
+      "enforcement": "router",
+      "text": "Execution reports technical state to management and does not redefine the user goal."
+    },
+    {
+      "id": "execution-direct-user-redirect",
+      "appliesTo": ["execution"],
+      "enforcement": "router",
+      "text": "Direct ordinary user business requests are redirected to management unless they carry a validated manual relay."
+    },
+    {
+      "id": "capability-probe",
+      "appliesTo": ["management"],
+      "enforcement": "adapter",
+      "text": "Probe create, send, wait and read capabilities before choosing native collaboration; otherwise disclose manual mode and missing capabilities."
+    },
+    {
+      "id": "handoff-intent-confirmation",
+      "appliesTo": ["management"],
+      "enforcement": "state-machine",
+      "text": "Detect migration intent around handoff or conversation transfer and obtain confirmation; ordinary continuation is not migration intent."
+    },
+    {
+      "id": "destination-skill-bootstrap",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "bootstrap",
+      "text": "Install or resolve the exact Skill version in every destination and require code-generated readiness before any business handoff."
+    },
+    {
+      "id": "code-handoff-bundle",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "handoff-bundle",
+      "text": "Transfer contract, event state, role policy, facts, boundaries and next action in a self-contained validated code bundle with no required external reads."
+    },
+    {
+      "id": "manual-collaboration-guidance",
+      "appliesTo": ["management", "execution"],
+      "enforcement": "adapter",
+      "text": "When native collaboration is unavailable, generate a user-forwardable relay that invokes the same bootstrap and code-bundle receiver and explains the manual steps."
+    },
+    {
+      "id": "management-supervision",
+      "appliesTo": ["management"],
+      "enforcement": "state-machine",
+      "text": "Management waits for execution, checks intermediate state, corrects direction and independently accepts the final outcome."
+    },
+    {
+      "id": "checkpoint-not-final",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "state-machine",
+      "text": "A checkpoint, report or local fake is not final acceptance."
+    },
+    {
+      "id": "source-session-removal",
+      "appliesTo": ["management"],
+      "enforcement": "migration",
+      "text": "After destination readiness, code handoff acceptance and management confirmation, remove the exact source task by delete or archive only when user-authorized."
+    },
+    {
+      "id": "artifact-layout",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "storage",
+      "text": "Place Skill artifacts under one controlled project-local root with contracts, state, reports, handoffs, evidence and temporary data separated."
+    },
+    {
+      "id": "retention-current-previous",
+      "appliesTo": ["management"],
+      "enforcement": "retention",
+      "text": "After accepted completion or handoff, retain current and previous generations and remove only registered older Skill-owned artifacts after a dry run."
+    },
+    {
+      "id": "preserve-user-state",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "safety",
+      "text": "Do not delete or overwrite user data, credentials, configuration, sessions, dependencies, Git objects or unregistered files through artifact retention."
+    },
+    {
+      "id": "secret-redaction",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "serialization",
+      "text": "Redact credentials before writing contracts, events, reports, handoffs or public artifacts."
+    },
+    {
+      "id": "release-batch",
+      "appliesTo": ["management"],
+      "enforcement": "release",
+      "text": "Collect all defects found in one continuous user request into one release batch and publish one version after the batch passes."
+    },
+    {
+      "id": "semantic-versioning",
+      "appliesTo": ["management"],
+      "enforcement": "release",
+      "text": "Bump patch for compatible fixes, minor for backward-compatible capabilities and major only with explicit user authorization."
+    }
+  ]
+}

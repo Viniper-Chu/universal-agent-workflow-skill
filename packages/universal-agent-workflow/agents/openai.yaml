@@ -1,0 +1,4 @@
+interface:
+  display_name: "Universal Agent Workflow"
+  short_description: "Contract-first cross-session workflow engine"
+  default_prompt: "Use $universal-agent-workflow to plan, route, audit, and hand off governed work."

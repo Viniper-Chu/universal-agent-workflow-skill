@@ -1,0 +1,16 @@
+[build-system]
+requires = []
+build-backend = "setuptools.build_meta:__legacy__"
+
+[project]
+name = "universal-agent-workflow"
+version = "0.0.1"
+description = "Contract-first management and execution workflow engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []
+
+[tool.universal-agent-workflow]
+skill-package = "packages/universal-agent-workflow"
+retention-generations = 2

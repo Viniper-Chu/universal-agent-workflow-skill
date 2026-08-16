@@ -1,0 +1,22 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile scripts
+        run: python -m compileall -q packages/universal-agent-workflow/scripts
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Skill selftest
+        run: python packages/universal-agent-workflow/scripts/uaw.py selftest
+      - name: Skill install validation
+        run: python packages/universal-agent-workflow/scripts/uaw.py validate-install --skill-dir packages/universal-agent-workflow
