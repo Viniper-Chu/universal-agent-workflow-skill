@@ -96,7 +96,9 @@ class WorkflowEngineTests(unittest.TestCase):
         store.receive_code_handoff("execution-handoff", exported["bundlePath"], "execution-7", "execution")
         with self.assertRaisesRegex(WorkflowError, "role does not match"):
             store.handoff_accept("execution-handoff", "management", "management-7")
-        snapshot = store.handoff_accept("execution-handoff", "execution", "management-7")
+        with self.assertRaisesRegex(WorkflowError, "peer does not match"):
+            store.handoff_accept("execution-handoff", "execution", "execution-7")
+        snapshot = store.handoff_accept("execution-handoff", "execution", "source-session")
         self.assertTrue(snapshot["handoff_accepted"])
 
     def receipt(self, destination="destination"):
@@ -366,7 +368,7 @@ class WorkflowEngineTests(unittest.TestCase):
             self.assertFalse(received["externalReadsRequired"])
             with self.assertRaises(WorkflowError):
                 store.dispatch("task")
-            store.handoff_accept("task", "execution", "execution-peer")
+            store.handoff_accept("task", "execution", "source-session")
             self.assertEqual(store.state("task")["status"], "destination_ready")
             store.dispatch("task")
             self.assertEqual(store.state("task")["status"], "dispatched")
@@ -380,7 +382,7 @@ class WorkflowEngineTests(unittest.TestCase):
         store.bootstrap("task", "execution", "target-session", "management-peer", "controlled-install", "native")
         store.destination_ready("task", self.receipt("target-session"), expected_role="execution", expected_destination_id="target-session")
         self.export_and_receive(store, "target-session")
-        store.handoff_accept("task", "execution", "execution-peer")
+        store.handoff_accept("task", "execution", "source-session")
         store.handoff_complete("task")
         store.authorize_migration("task", "source-session", "target-session", "current-session")
 
@@ -754,7 +756,7 @@ class WorkflowEngineTests(unittest.TestCase):
                 *common,
                 "--task-id", "handoff-task",
                 "--role", "execution",
-                "--peer-identity", "execution-8",
+                "--peer-identity", "source-8",
             ).stdout.decode("utf-8"))
             self.assertTrue(accepted["handoff_accepted"])
         finally:

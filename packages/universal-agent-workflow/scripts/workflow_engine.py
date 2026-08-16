@@ -317,6 +317,7 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
         "readiness_receipt": None,
         "destination_id": None,
         "handoff_requested": False,
+        "handoff_packet": None,
         "handoff_bundle_received": False,
         "handoff_bundle_receipt": None,
         "handoff_accepted": False,
@@ -361,6 +362,7 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
         elif event_name == "handoff.requested":
             state["status"] = "handoff_pending"
             state["handoff_requested"] = True
+            state["handoff_packet"] = payload.get("packet")
         elif event_name == "handoff.bundle_received":
             state["status"] = "handoff_pending"
             state["handoff_bundle_received"] = True
@@ -498,6 +500,11 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
             raise WorkflowError("handoff acceptance requires role and peer identity")
         if payload.get("role") != state.get("contract", {}).get("destination_role", "execution"):
             raise WorkflowError("handoff acceptance role does not match the contract destination role")
+        source_session_id = state.get("handoff_packet", {}).get("source", {}).get("sessionId")
+        if not _nonempty(source_session_id):
+            raise WorkflowError("handoff acceptance requires the code bundle source identity")
+        if payload.get("peer_identity") != source_session_id:
+            raise WorkflowError("handoff acceptance peer does not match the code bundle source identity")
         return
     if event == "handoff.completed":
         if status not in {"destination_ready", "handoff_pending"} or not state.get("destination_ready") or not state.get("handoff_accepted"):
@@ -1391,7 +1398,7 @@ def run_selftest() -> dict[str, Any]:
         received = store.receive_code_handoff("handoff-demo", exported["bundlePath"], "dest-2", "execution")
         checks["code_handoff_received"] = received["receipt"]["accepted"] is True and received["externalReadsRequired"] is False
         checks["code_handoff_routes"] = route_request("execution", "接收", exported["bundle"])["route"] == "ACCEPT_CODE_HANDOFF"
-        store.handoff_accept("handoff-demo", "execution", "execution-peer")
+        store.handoff_accept("handoff-demo", "execution", "source-session")
         store.handoff_complete("handoff-demo")
         checks["code_handoff_complete"] = store.state("handoff-demo")["handoff_complete"] is True
         broken_bundle = dict(exported["bundle"])
