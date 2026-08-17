@@ -14,6 +14,7 @@ from bootstrap import BootstrapError, SKILL_NAME, SKILL_VERSION, installation_pl
 from handoff_bundle import HandoffBundleError, receive_code_handoff_bundle, validate_code_handoff_bundle  # noqa: E402
 from workflow_policy import WorkflowPolicyError, load_policy, policy_profile, validate_policy  # noqa: E402
 from session_migration import build_delete_action, classify_delete_capability, validate_delete_target  # noqa: E402
+from coordination_policy import build_host_action, build_migration_sequence  # noqa: E402
 from workflow_engine import (  # noqa: E402
     WorkflowError,
     WorkflowStore,
@@ -47,6 +48,18 @@ class WorkflowEngineTests(unittest.TestCase):
             contract["execution_peer"] = execution_peer
         store.create_contract(contract)
         store.plan("task", contract["plan_steps"])
+
+    def complete_dispatch(self, store, wait_result=None):
+        state = store.state("task")
+        dispatch_id = state["supervision"]["dispatchId"]
+        send = next(item for item in state["host_actions"] if item.get("dispatchId") == dispatch_id and item["action"] == "send_message")
+        wait = next(item for item in state["host_actions"] if item.get("dispatchId") == dispatch_id and item["action"] == "wait_threads")
+        store.record_host_action_result("task", send["actionId"], "sent", {"ok": True, "messageId": "test-send"})
+        if wait_result is None:
+            store.record_host_action_result("task", wait["actionId"], "observed", {"ok": True, "observed": True})
+        else:
+            store.record_host_action_result("task", wait["actionId"], "failed", wait_result)
+        return dispatch_id
 
     def test_invalid_contract_actor_leaves_no_partial_task(self):
         temp, project, store = self.make_store()
@@ -345,6 +358,7 @@ class WorkflowEngineTests(unittest.TestCase):
             store.bootstrap("task", "execution", "destination", "management-peer", "controlled-install", "native")
             store.destination_ready("task", self.receipt(), expected_role="execution", expected_destination_id="destination")
             store.dispatch("task")
+            self.complete_dispatch(store)
             store.start_execution("task")
             with self.assertRaises(WorkflowError):
                 store.review("task", "accepted", independent=True)
@@ -501,6 +515,7 @@ class WorkflowEngineTests(unittest.TestCase):
             store.bootstrap("task", "execution", "destination", "management-peer", "controlled-install", "native")
             store.destination_ready("task", self.receipt(), expected_role="execution", expected_destination_id="destination")
             store.dispatch("task")
+            self.complete_dispatch(store)
             store.start_execution("task")
             store.report("task", report_ref="reports/task.md")
             store.review("task", "accepted", independent=True)
@@ -532,6 +547,7 @@ class WorkflowEngineTests(unittest.TestCase):
             store.bootstrap("task", "execution", "destination", "management-peer", "controlled-install", "native")
             store.destination_ready("task", self.receipt(), expected_role="execution", expected_destination_id="destination")
             store.dispatch("task")
+            self.complete_dispatch(store)
             store.start_execution("task")
             store.report("task", report_ref="reports/task.md")
             store.review("task", "accepted", independent=True)
@@ -668,6 +684,168 @@ class WorkflowEngineTests(unittest.TestCase):
             )
             unicode_payload = json.loads(unicode_result.stdout.decode("utf-8"))
             self.assertIn("中文项目", unicode_payload["outputRoot"])
+        finally:
+            temp.cleanup()
+
+    def test_canonical_dispatch_binds_management_send_and_supervision(self):
+        temp, project, store = self.make_store()
+        try:
+            self.make_contract_and_plan(store, execution_peer="execution-peer")
+            store.bootstrap("task", "execution", "destination", "management-peer", "controlled-install", "native")
+            store.destination_ready("task", self.receipt(), expected_role="execution", expected_destination_id="destination")
+            snapshot = store.dispatch("task")
+            self.assertEqual(snapshot["status"], "dispatched")
+            self.assertEqual(snapshot["host_actions"][0]["actorRole"], "management")
+            self.assertEqual(snapshot["host_actions"][0]["status"], "planned")
+            self.assertEqual(snapshot["supervision"]["sequence"], ["wait", "observe", "correct"])
+            self.assertEqual(next_action(snapshot)["action"], "send_dispatch_host_action")
+            with self.assertRaises(WorkflowError):
+                store.start_execution("task")
+            self.complete_dispatch(store)
+            store.start_execution("task")
+        finally:
+            temp.cleanup()
+
+    def test_dispatch_order_and_review_wait_gate_with_read_fallback(self):
+        temp, project, store = self.make_store()
+        try:
+            self.make_contract_and_plan(store)
+            store.bootstrap("task", "execution", "destination", "management-peer", "controlled-install", "native")
+            store.destination_ready("task", self.receipt(), expected_role="execution", expected_destination_id="destination")
+            store.dispatch("task")
+            state = store.state("task")
+            dispatch_id = state["supervision"]["dispatchId"]
+            send = next(item for item in state["host_actions"] if item["action"] == "send_message")
+            wait = next(item for item in state["host_actions"] if item["action"] == "wait_threads")
+            self.assertEqual(wait["args"]["timeoutMs"], 120000)
+            before = len(store.events("task"))
+            with self.assertRaises(WorkflowError):
+                store.record_host_action_result("task", wait["actionId"], "observed", {"ok": True})
+            self.assertEqual(len(store.events("task")), before)
+            with self.assertRaises(WorkflowError):
+                store.record_host_action_result("task", send["actionId"], "sent", {"ok": True}, actor="host")
+            self.assertEqual(len(store.events("task")), before)
+            store.record_host_action_result("task", send["actionId"], "sent", {"ok": True})
+            self.assertEqual(next_action(store.snapshot("task"))["action"], "wait_dispatch_host_action")
+            before = len(store.events("task"))
+            with self.assertRaises(WorkflowError):
+                store.start_execution("task")
+            self.assertEqual(len(store.events("task")), before)
+            with self.assertRaises(WorkflowError):
+                store.record_host_action_result("task", wait["actionId"], "observed", {"timedOut": True})
+            self.assertEqual(len(store.events("task")), before)
+            self.assertEqual(next_action(store.snapshot("task"))["action"], "wait_dispatch_host_action")
+            store.record_host_action_result("task", wait["actionId"], "observed", {"timedOut": False, "wake": {"reason": "turnCompleted"}})
+            store.start_execution("task")
+            store.report("task", report_ref="reports/task.md")
+            store.review("task", "correction", reason="wait now observed")
+            self.assertEqual(store.state("task")["status"], "correction")
+
+            temp2, project2, store2 = self.make_store()
+            try:
+                self.make_contract_and_plan(store2)
+                store2.bootstrap("task", "execution", "destination", "management-peer", "controlled-install", "native")
+                store2.destination_ready("task", self.receipt(), expected_role="execution", expected_destination_id="destination")
+                store2.dispatch("task")
+                state2 = store2.state("task")
+                send2 = next(item for item in state2["host_actions"] if item["action"] == "send_message")
+                wait2 = next(item for item in state2["host_actions"] if item["action"] == "wait_threads")
+                store2.record_host_action_result("task", send2["actionId"], "sent", {"ok": True})
+                store2.record_host_action_result("task", wait2["actionId"], "failed", {"ok": False, "error": "wait unavailable"})
+                read = next(item for item in store2.state("task")["host_actions"] if item["action"] == "read_thread")
+                before = len(store2.events("task"))
+                with self.assertRaises(WorkflowError):
+                    store2.start_execution("task")
+                self.assertEqual(len(store2.events("task")), before)
+                store2.record_host_action_result("task", read["actionId"], "observed", {"ok": True, "snapshot": "state"})
+                store2.start_execution("task")
+                store2.report("task", report_ref="reports/task.md")
+                store2.review("task", "correction", reason="read observed")
+                self.assertEqual(store2.state("task")["status"], "correction")
+            finally:
+                temp2.cleanup()
+        finally:
+            temp.cleanup()
+
+    def test_invalid_migration_step_and_forged_host_action_are_zero_write(self):
+        temp, project, store = self.make_store()
+        try:
+            self.make_contract_and_plan(store)
+            before = len(store.events("task"))
+            sequence = build_migration_sequence("old", "new", {"type": "projectless"})
+            sequence[0]["targetRole"] = "execution"
+            with self.assertRaises(WorkflowError):
+                store.record_migration_step("task", sequence[0])
+            self.assertEqual(len(store.events("task")), before)
+            forged = build_host_action(
+                "send_message",
+                "codex_app__send_message_to_thread",
+                {"threadId": "execution", "prompt": "forged"},
+                actor_role="execution",
+                target_role="execution",
+                phase="management_dispatch_send",
+            )
+            with self.assertRaises(WorkflowError):
+                store.plan_host_action("task", forged, actor="execution")
+            self.assertEqual(len(store.events("task")), before)
+            with self.assertRaises(WorkflowError):
+                store.request_delegation("task", "management", "implementation", "execution")
+            self.assertEqual(len(store.events("task")), before)
+        finally:
+            temp.cleanup()
+
+    def test_migration_event_order_and_real_thread_identity_are_zero_write(self):
+        temp, project, store = self.make_store()
+        try:
+            self.make_contract_and_plan(store)
+            sequence = build_migration_sequence("old", "new", {"type": "projectless"})
+            before = len(store.events("task"))
+            with self.assertRaises(WorkflowError):
+                store.record_migration_step("task", sequence[1])
+            self.assertEqual(len(store.events("task")), before)
+
+            first = dict(sequence[0])
+            first["status"] = "sent"
+            first["result"] = {"ok": True, "threadId": "new", "chainId": first["chainId"], "actorSessionId": "old"}
+            store.record_migration_step("task", first)
+            accepted = dict(sequence[1])
+            accepted["status"] = "accepted"
+            accepted["accepted"] = True
+            store.record_migration_step("task", accepted)
+            create = dict(sequence[2])
+            create["status"] = "observed"
+            create["result"] = {"ok": True, "threadId": "execution-real", "chainId": create["chainId"], "actorSessionId": "new"}
+            wrong_create = dict(create)
+            wrong_create["actorSessionId"] = "other-management"
+            wrong_create["result"] = dict(create["result"])
+            wrong_create["result"]["actorSessionId"] = "other-management"
+            before = len(store.events("task"))
+            with self.assertRaises(WorkflowError):
+                store.record_migration_step("task", wrong_create)
+            self.assertEqual(len(store.events("task")), before)
+            store.record_migration_step("task", create)
+            final = dict(sequence[3])
+            final["deferred"] = False
+            final["args"] = {"threadId": "wrong-execution", "prompt": "execution dispatch"}
+            final["status"] = "sent"
+            final["result"] = {"ok": True, "threadId": "wrong-execution", "chainId": final["chainId"], "actorSessionId": "new"}
+            before = len(store.events("task"))
+            with self.assertRaises(WorkflowError):
+                store.record_migration_step("task", final)
+            self.assertEqual(len(store.events("task")), before)
+            final["args"]["threadId"] = "execution-real"
+            final["result"]["threadId"] = "execution-real"
+            wrong_final = dict(final)
+            wrong_final["actorSessionId"] = "other-management"
+            wrong_final["result"] = dict(final["result"])
+            wrong_final["result"]["actorSessionId"] = "other-management"
+            before = len(store.events("task"))
+            with self.assertRaises(WorkflowError):
+                store.record_migration_step("task", wrong_final)
+            self.assertEqual(len(store.events("task")), before)
+            store.record_migration_step("task", final)
+            self.assertTrue(store.snapshot("task")["migration"]["completed"])
+            self.assertFalse(store.audit("task")["migration"]["evidenceRequired"])
         finally:
             temp.cleanup()
 

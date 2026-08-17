@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "policyName": "universal-agent-workflow-runtime-policy",
-  "policyVersion": "0.0.1",
+  "policyVersion": "0.0.2",
   "runtimeAuthority": "code-state",
   "externalMarkdownRequired": false,
   "rules": [

@@ -16,7 +16,7 @@ The engine accepts a JSON object with these required fields:
   "destination_role": "execution",
   "migration_policy": {"enabled": false},
   "skill_name": "universal-agent-workflow",
-  "skill_version": "0.0.1"
+  "skill_version": "0.0.2"
 }
 ```
 

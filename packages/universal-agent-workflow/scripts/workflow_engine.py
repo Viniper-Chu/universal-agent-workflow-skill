@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from bootstrap import SKILL_NAME, SKILL_VERSION, make_bootstrap_packet, validate_readiness_receipt
+from bootstrap import BootstrapError, SKILL_NAME, SKILL_VERSION, make_bootstrap_packet, validate_readiness_receipt
 from handoff_bundle import (
     HandoffBundleError,
     build_code_handoff_bundle,
@@ -24,6 +24,23 @@ from handoff_bundle import (
     validate_continuity_context,
 )
 from session_migration import build_delete_action, classify_delete_capability, inventory_tools, validate_delete_target
+from coordination_policy import (
+    CoordinationPolicyError,
+    DEFAULT_WAIT_TIMEOUT_MS,
+    build_host_action,
+    build_migration_sequence,
+    build_supervision_plan,
+    classify_wait_result,
+    coordination_policy_projection,
+    MIGRATION_PHASES,
+    record_host_action,
+    summarize_migration_steps,
+    validate_create_target,
+    validate_delegation,
+    validate_host_action,
+    validate_migration_step,
+    validate_migration_sequence,
+)
 from retention import (
     cleanup_artifacts,
     register_artifact as register_retention_artifact,
@@ -66,6 +83,13 @@ EVENTS = {
     "source-session.removal_failed",
     "source-session.removed",
     "dispatch.requested",
+    "host-action.planned",
+    "host-action.sent",
+    "host-action.observed",
+    "host-action.failed",
+    "coordination.migration_step",
+    "coordination.supervision_updated",
+    "coordination.delegation_requested",
     "execution.started",
     "execution.reported",
     "review.correction_requested",
@@ -91,6 +115,13 @@ EVENT_ACTOR_ROLES: dict[str, set[str]] = {
     "source-session.removal_failed": {"host", "system"},
     "source-session.removed": {"host", "system"},
     "dispatch.requested": {"management"},
+    "host-action.planned": {"management", "execution"},
+    "host-action.sent": {"management", "execution", "host", "system"},
+    "host-action.observed": {"management", "execution", "host", "system"},
+    "host-action.failed": {"management", "execution", "host", "system"},
+    "coordination.migration_step": {"management"},
+    "coordination.supervision_updated": {"management"},
+    "coordination.delegation_requested": {"management", "execution", "reviewer"},
     "execution.started": {"execution"},
     "execution.reported": {"execution"},
     "review.correction_requested": {"management"},
@@ -102,6 +133,7 @@ EVENT_ACTOR_ROLES: dict[str, set[str]] = {
     "retention.applied": {"management", "system"},
 }
 ACTORS = {"management", "execution", "reviewer", "host", "system"}
+LEGACY_SKILL_VERSIONS = {"0.0.1"}
 
 
 class WorkflowError(RuntimeError):
@@ -120,6 +152,97 @@ def _as_dict(value: Any, label: str) -> dict[str, Any]:
 
 def _nonempty(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _dispatch_actions(state: dict[str, Any], dispatch_id: str | None) -> list[dict[str, Any]]:
+    if not _nonempty(dispatch_id):
+        return []
+    return [item for item in state.get("host_actions", []) if item.get("dispatchId") == dispatch_id]
+
+
+def _dispatch_send_action(state: dict[str, Any], dispatch_id: str | None) -> dict[str, Any] | None:
+    return next((item for item in _dispatch_actions(state, dispatch_id) if item.get("action") == "send_message"), None)
+
+
+def _dispatch_wait_action(state: dict[str, Any], dispatch_id: str | None) -> dict[str, Any] | None:
+    return next((item for item in _dispatch_actions(state, dispatch_id) if item.get("action") == "wait_threads"), None)
+
+
+def _dispatch_read_action(state: dict[str, Any], dispatch_id: str | None) -> dict[str, Any] | None:
+    return next((item for item in _dispatch_actions(state, dispatch_id) if item.get("action") == "read_thread"), None)
+
+
+def _dispatch_review_ready(state: dict[str, Any], dispatch_id: str | None) -> bool:
+    wait = _dispatch_wait_action(state, dispatch_id)
+    if wait is None:
+        return False
+    if wait.get("status") == "observed":
+        try:
+            return classify_wait_result(
+                wait.get("result"),
+                allow_legacy_shape=bool(state.get("legacy_compatibility")),
+            )["kind"] == "observed"
+        except CoordinationPolicyError:
+            return False
+    if wait.get("status") == "failed":
+        try:
+            if classify_wait_result(
+                wait.get("result"),
+                allow_legacy_shape=bool(state.get("legacy_compatibility")),
+            )["kind"] != "tool_error":
+                return False
+        except CoordinationPolicyError:
+            return False
+        read = _dispatch_read_action(state, dispatch_id)
+        return bool(read and read.get("status") == "observed")
+    return False
+
+
+def _legacy_start_compatibility(state: dict[str, Any]) -> bool:
+    """Allow replay of pre-0.0.2 start events without weakening new tasks."""
+    receipt = state.get("readiness_receipt")
+    return bool(
+        state.get("legacy_compatibility")
+        and isinstance(receipt, dict)
+        and receipt.get("skillVersion") in LEGACY_SKILL_VERSIONS
+    )
+
+
+def _validate_migration_progress(state: dict[str, Any], step: dict[str, Any]) -> None:
+    """Validate a migration event against the already observed chain."""
+    previous = state.get("migration_steps", [])
+    index = len(previous)
+    try:
+        validate_migration_step(step, index)
+    except CoordinationPolicyError as exc:
+        raise WorkflowError(str(exc)) from exc
+    if index == 0:
+        return
+    if previous[0].get("chainId") != step.get("chainId"):
+        raise WorkflowError("migration step chainId must stay bound to one chain")
+    if index == 1:
+        if previous[0].get("status") not in {"sent", "observed"}:
+            raise WorkflowError("new management acceptance requires the old management send result")
+        if step.get("status") != "accepted" or step.get("accepted") is not True:
+            raise WorkflowError("migration acceptance event must record accepted=true")
+        if step.get("actorSessionId") != step.get("threadId"):
+            raise WorkflowError("migration acceptance actorSessionId must match its threadId")
+        return
+    if index == 2:
+        if previous[1].get("status") != "accepted":
+            raise WorkflowError("execution creation requires the accepted new management gate")
+        if step.get("actorSessionId") != previous[1].get("actorSessionId"):
+            raise WorkflowError("execution creation actorSessionId must match accepted management")
+        return
+    if index == 3:
+        create = previous[2]
+        if create.get("status") != "observed" or not isinstance(create.get("result"), dict) or not _nonempty(create["result"].get("threadId")):
+            raise WorkflowError("execution dispatch requires an observed create_thread threadId")
+        if step.get("deferred") is True or step.get("args", {}).get("threadId") != create["result"].get("threadId"):
+            raise WorkflowError("execution dispatch must target the observed create_thread threadId")
+        accepted_session = previous[1].get("actorSessionId")
+        if create.get("actorSessionId") != accepted_session or step.get("actorSessionId") != accepted_session:
+            raise WorkflowError("execution dispatch actorSessionId must match accepted management")
 
 
 _SECRET_PATTERNS = [
@@ -338,6 +461,11 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
         "last_reason": None,
         "last_event": None,
         "event_count": 0,
+        "host_actions": [],
+        "migration_steps": [],
+        "migration": summarize_migration_steps([]),
+        "supervision": None,
+        "legacy_compatibility": False,
         "retention_dry_run_done": False,
         "retention_applied": False,
     }
@@ -359,10 +487,14 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
             state["destination_ready"] = True
             state["readiness_receipt"] = payload.get("receipt")
             state["destination_id"] = payload.get("receipt", {}).get("destinationId") or payload.get("receipt", {}).get("stableSessionId")
+            if payload.get("receipt", {}).get("skillVersion") in LEGACY_SKILL_VERSIONS:
+                state["legacy_compatibility"] = True
         elif event_name == "handoff.requested":
             state["status"] = "handoff_pending"
             state["handoff_requested"] = True
             state["handoff_packet"] = payload.get("packet")
+            if payload.get("packet", {}).get("skillVersion") in LEGACY_SKILL_VERSIONS:
+                state["legacy_compatibility"] = True
         elif event_name == "handoff.bundle_received":
             state["status"] = "handoff_pending"
             state["handoff_bundle_received"] = True
@@ -373,6 +505,24 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
         elif event_name == "handoff.completed":
             state["status"] = "handoff_complete"
             state["handoff_complete"] = True
+        elif event_name == "host-action.planned":
+            action = payload.get("action")
+            if isinstance(action, dict):
+                state["host_actions"].append(action)
+        elif event_name in {"host-action.sent", "host-action.observed", "host-action.failed"}:
+            action_id = payload.get("actionId")
+            for index, action in enumerate(state["host_actions"]):
+                if action.get("actionId") == action_id:
+                    updated = dict(action)
+                    updated["status"] = event_name.split(".", 1)[1]
+                    updated["result"] = payload.get("result")
+                    state["host_actions"][index] = updated
+                    break
+        elif event_name == "coordination.migration_step":
+            state["migration_steps"].append(payload.get("step", {}))
+            state["migration"] = summarize_migration_steps(state["migration_steps"])
+        elif event_name == "coordination.supervision_updated":
+            state["supervision"] = payload.get("plan")
         elif event_name in {"source-session.delete_requested", "source-session.removal_requested"}:
             state["source_delete_requested"] = True
             state["source_removal_requested"] = True
@@ -460,7 +610,21 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
     if event == "destination.ready":
         if status != "bootstrap_pending":
             raise WorkflowError("readiness receipt is only accepted after bootstrap request")
-        receipt = validate_readiness_receipt(payload.get("receipt"), expected_role=payload.get("expected_role"), expected_destination_id=payload.get("expected_destination_id"))
+        receipt_value = payload.get("receipt")
+        try:
+            receipt = validate_readiness_receipt(receipt_value, expected_role=payload.get("expected_role"), expected_destination_id=payload.get("expected_destination_id"))
+        except BootstrapError as exc:
+            if not isinstance(receipt_value, dict) or receipt_value.get("skillVersion") not in LEGACY_SKILL_VERSIONS:
+                raise WorkflowError(str(exc)) from exc
+            # A task started under 0.0.1 may finish its immutable handoff log
+            # after the runtime moves to 0.0.2.  Accept only the validated
+            # legacy receipt shape and mark the replay as compatibility state;
+            # all newly generated receipts still require the current version.
+            legacy = dict(receipt_value)
+            legacy["skillVersion"] = SKILL_VERSION
+            legacy["policyVersion"] = SKILL_VERSION
+            receipt = validate_readiness_receipt(legacy, expected_role=payload.get("expected_role"), expected_destination_id=payload.get("expected_destination_id"))
+            state["legacy_compatibility"] = True
         if not receipt["ready"]:
             raise WorkflowError("destination receipt is not ready")
         return
@@ -469,16 +633,29 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
             raise WorkflowError("handoff requires a validated destination receipt")
         if status not in {"destination_ready", "accepted", "reviewing", "correction", "executing"}:
             raise WorkflowError("handoff cannot start from current state")
+        packet = payload.get("packet")
         try:
             validate_code_handoff_bundle(
-                payload.get("packet"),
+                packet,
                 expected_skill_name=SKILL_NAME,
                 expected_skill_version=SKILL_VERSION,
                 expected_destination_id=state.get("destination_id"),
                 expected_role=state.get("contract", {}).get("destination_role", "execution"),
             )
         except HandoffBundleError as exc:
-            raise WorkflowError(str(exc)) from exc
+            if not isinstance(packet, dict) or packet.get("skillVersion") not in LEGACY_SKILL_VERSIONS:
+                raise WorkflowError(str(exc)) from exc
+            try:
+                validate_code_handoff_bundle(
+                    packet,
+                    expected_skill_name=SKILL_NAME,
+                    expected_skill_version=None,
+                    expected_destination_id=state.get("destination_id"),
+                    expected_role=state.get("contract", {}).get("destination_role", "execution"),
+                )
+            except HandoffBundleError as legacy_exc:
+                raise WorkflowError(str(legacy_exc)) from legacy_exc
+            state["legacy_compatibility"] = True
         return
     if event == "handoff.bundle_received":
         if status != "handoff_pending" or not state.get("handoff_requested"):
@@ -549,10 +726,114 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
             raise WorkflowError("dispatch requires a validated destination readiness receipt")
         if status not in {"planning", "destination_ready", "accepted", "correction"}:
             raise WorkflowError("dispatch cannot start from current state")
+        if not _nonempty(payload.get("dispatchId")):
+            if not (state.get("legacy_compatibility") and payload.get("packet_ref") and not state.get("supervision") and not state.get("host_actions")):
+                raise WorkflowError("dispatch requires a code-backed dispatch identity")
+        if _nonempty(payload.get("dispatchId")) and (state.get("supervision") or {}).get("dispatchId") == payload.get("dispatchId"):
+            raise WorkflowError("dispatch identity already exists")
+        return
+    if event == "host-action.planned":
+        try:
+            action = validate_host_action(payload.get("action"))
+        except CoordinationPolicyError as exc:
+            raise WorkflowError(str(exc)) from exc
+        if action.get("status") != "planned":
+            raise WorkflowError("planned host action must have planned status")
+        if actor != action.get("actorRole"):
+            raise WorkflowError("host-action event actor must match action.actorRole")
+        if action.get("action") in {"create_thread", "send_message"} and action.get("actorRole") != "management":
+            raise WorkflowError("create/send host actions can only be planned by management")
+        if action.get("dispatchId") and action.get("action") in {"send_message", "wait_threads", "read_thread"}:
+            if action.get("dispatchId") != (state.get("supervision") or {}).get("dispatchId"):
+                raise WorkflowError("host action dispatchId must match the current dispatch")
+        if any(item.get("actionId") == action.get("actionId") for item in state.get("host_actions", [])):
+            raise WorkflowError("host action identity already exists")
+        return
+    if event in {"host-action.sent", "host-action.observed", "host-action.failed"}:
+        action_id = payload.get("actionId")
+        current = next((item for item in state.get("host_actions", []) if item.get("actionId") == action_id), None)
+        if current is None:
+            raise WorkflowError("host action result requires a planned action")
+        if actor != current.get("actorRole"):
+            raise WorkflowError("host-action result actor must match the planned action actorRole")
+        dispatch_id = current.get("dispatchId")
+        if current.get("action") == "wait_threads":
+            send = _dispatch_send_action(state, dispatch_id)
+            if not send or send.get("status") not in {"sent", "observed"}:
+                raise WorkflowError("wait result requires the same dispatch send action to be sent first")
+        if current.get("action") == "read_thread":
+            wait = _dispatch_wait_action(state, dispatch_id)
+            if not wait or wait.get("status") != "failed":
+                raise WorkflowError("read fallback requires a failed wait for the same dispatch")
+        target_status = event.split(".", 1)[1]
+        try:
+            record_host_action(
+                current,
+                target_status,
+                payload.get("result"),
+                allow_legacy_wait_shape=bool(state.get("legacy_compatibility")),
+            )
+        except CoordinationPolicyError as exc:
+            raise WorkflowError(str(exc)) from exc
+        return
+    if event == "coordination.migration_step":
+        step = payload.get("step")
+        if not isinstance(step, dict):
+            raise WorkflowError("migration step must be an object")
+        _validate_migration_progress(state, step)
+        if actor != "management":
+            raise WorkflowError("management migration steps must be recorded by management")
+        return
+    if event == "coordination.delegation_requested":
+        decision = payload.get("decision")
+        if not isinstance(decision, dict) or decision.get("ok") is not True:
+            raise WorkflowError("delegation request requires a code-backed decision")
+        require = decision.get("require")
+        if not isinstance(require, dict) or require.get("allowed") is not True or require.get("eventWriteAllowed") is not True:
+            raise WorkflowError("rejected delegation cannot write an event")
+        if actor != decision.get("parentRole"):
+            raise WorkflowError("delegation event actor must match parent role")
+        return
+    if event == "coordination.supervision_updated":
+        plan = payload.get("plan")
+        if not isinstance(plan, dict) or plan.get("schemaVersion") != 1:
+            raise WorkflowError("supervision update requires a code-backed plan")
+        if status not in {"dispatched", "executing", "reviewing", "correction"}:
+            raise WorkflowError("supervision update requires an active dispatch")
+        if plan.get("failureClass") == "orchestration_harness_failure" and plan.get("writeAllowed") is not False:
+            raise WorkflowError("wait failure fallback must remain read-only")
+        wait_result = plan.get("waitResult")
+        if wait_result is not None:
+            try:
+                wait_class = classify_wait_result(wait_result)
+            except CoordinationPolicyError as exc:
+                raise WorkflowError(str(exc)) from exc
+            if wait_class["kind"] == "timeout":
+                if plan.get("nextAction") != "wait" or plan.get("reviewReady") is not False or plan.get("failureClass") is not None:
+                    raise WorkflowError("wait timeout must continue waiting without review or harness failure")
+            elif wait_class["kind"] == "observed":
+                if plan.get("reviewReady") is not True or plan.get("failureClass") is not None:
+                    raise WorkflowError("observed wait must be review-ready without harness failure")
+            elif plan.get("failureClass") != "orchestration_harness_failure":
+                raise WorkflowError("tool wait failure requires orchestration_harness_failure")
         return
     if event == "execution.started":
         if status not in {"dispatched", "correction"}:
             raise WorkflowError("execution must start after dispatch")
+        supervision = state.get("supervision")
+        dispatch_id = supervision.get("dispatchId") if isinstance(supervision, dict) else None
+        send = _dispatch_send_action(state, dispatch_id)
+        legacy_lifecycle_start = bool(
+            _legacy_start_compatibility(state)
+            and state.get("last_event") == "dispatch.requested"
+            and not state.get("host_actions")
+            and not supervision
+        )
+        if not send or send.get("status") not in {"sent", "observed"}:
+            if not legacy_lifecycle_start:
+                raise WorkflowError("execution start requires the current dispatch send action to be sent")
+        if not _dispatch_review_ready(state, dispatch_id) and not legacy_lifecycle_start:
+            raise WorkflowError("execution start requires current-dispatch wait observed or read fallback evidence")
         return
     if event == "execution.reported":
         if status != "executing" or not _nonempty(payload.get("report_ref")):
@@ -561,12 +842,18 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
     if event == "review.correction_requested":
         if status != "reviewing":
             raise WorkflowError("correction requires a report under review")
+        supervision = state.get("supervision")
+        if not isinstance(supervision, dict) or not _dispatch_review_ready(state, supervision.get("dispatchId")):
+            raise WorkflowError("review requires same-dispatch wait observed or observed read fallback")
         return
     if event == "review.accepted":
         if status != "reviewing" or not state.get("execution_report_ref"):
             raise WorkflowError("independent review requires an execution report")
         if not payload.get("independent") or payload.get("checkpoint"):
             raise WorkflowError("checkpoint cannot be accepted as final")
+        supervision = state.get("supervision")
+        if not isinstance(supervision, dict) or not _dispatch_review_ready(state, supervision.get("dispatchId")):
+            raise WorkflowError("review requires same-dispatch wait observed or observed read fallback")
         return
     if event == "completion.requested":
         if status != "accepted" or not state.get("independent_acceptance"):
@@ -917,8 +1204,130 @@ class WorkflowStore:
     def record_source_removed(self, task_id: str, source_session_id: str, success: bool, actor: str = "host") -> dict[str, Any]:
         return self.record_source_deleted(task_id, source_session_id, success, actor)
 
-    def dispatch(self, task_id: str, actor: str = "management", packet_ref: str | None = None) -> dict[str, Any]:
-        return self._append(task_id, "dispatch.requested", {"packet_ref": packet_ref}, actor)
+    def dispatch(
+        self,
+        task_id: str,
+        actor: str = "management",
+        packet_ref: str | None = None,
+        dispatch_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Canonical dispatch: request, plan management send, then attach supervision.
+
+        The old dispatch entry point remains the only entry point, but it no
+        longer bypasses host-action planning or wait/observe/correct state.
+        Host execution is still represented as a later result event; this
+        method never fabricates a sent result.
+        """
+        state = self.state(task_id)
+        effective_dispatch_id = dispatch_id or f"{task_id}:dispatch:{state['event_count'] + 1}"
+        self._append(task_id, "dispatch.requested", {"dispatchId": effective_dispatch_id, "packet_ref": packet_ref}, actor)
+        destination = state.get("destination_id") or self.contract(task_id).get("execution_peer") or "execution"
+        self.update_supervision(task_id, effective_dispatch_id, actor=actor)
+        action = build_host_action(
+            "send_message",
+            "codex_app__send_message_to_thread",
+            {"threadId": destination, "prompt": packet_ref or "dispatch"},
+            actor_role="management",
+            target_role="execution",
+            phase="management_dispatch_send",
+            action_id=f"{effective_dispatch_id}:send",
+            dispatch_id=effective_dispatch_id,
+        )
+        self.plan_host_action(task_id, action, actor=actor)
+        wait = build_host_action(
+            "wait_threads",
+            "codex_app__wait_threads",
+            {"targets": [{"threadId": destination}], "timeoutMs": DEFAULT_WAIT_TIMEOUT_MS},
+            actor_role="management",
+            target_role="execution",
+            phase="management_dispatch_wait",
+            action_id=f"{effective_dispatch_id}:wait",
+            dispatch_id=effective_dispatch_id,
+        )
+        return self.plan_host_action(task_id, wait, actor=actor)
+
+    def dispatch_with_supervision(self, task_id: str, dispatch_id: str, actor: str = "management", packet_ref: str | None = None) -> dict[str, Any]:
+        return self.dispatch(task_id, actor=actor, packet_ref=packet_ref, dispatch_id=dispatch_id)
+
+    def plan_host_action(self, task_id: str, action: dict[str, Any], actor: str = "management") -> dict[str, Any]:
+        try:
+            normalized = validate_host_action(action)
+        except CoordinationPolicyError as exc:
+            raise WorkflowError(str(exc)) from exc
+        if normalized.get("actorRole") != actor:
+            raise WorkflowError("host-action planner actor must match action.actorRole")
+        if normalized.get("action") in {"create_thread", "send_message"} and actor != "management":
+            raise WorkflowError("create/send host actions can only be planned by management")
+        return self._append(task_id, "host-action.planned", {"action": normalized}, actor)
+
+    def record_host_action_result(self, task_id: str, action_id: str, status: str, result: Any = None, actor: str | None = None) -> dict[str, Any]:
+        state = self.state(task_id)
+        current = next((item for item in state.get("host_actions", []) if item.get("actionId") == action_id), None)
+        if current is None:
+            raise WorkflowError("host action result requires a planned action")
+        try:
+            updated = record_host_action(
+                current,
+                status,
+                result,
+                allow_legacy_wait_shape=bool(state.get("legacy_compatibility")),
+            )
+        except CoordinationPolicyError as exc:
+            raise WorkflowError(str(exc)) from exc
+        event = f"host-action.{status}"
+        event_actor = actor if actor is not None else current.get("actorRole")
+        snapshot = self._append(task_id, event, {"actionId": action_id, "result": updated.get("result")}, event_actor)
+        if current.get("action") == "wait_threads" and status == "failed":
+            targets = current.get("args", {}).get("targets") or []
+            destination = (targets[0].get("threadId") if targets and isinstance(targets[0], dict) else None) or current.get("args", {}).get("threadId")
+            fallback = build_host_action(
+                "read_thread",
+                "codex_app__read_thread",
+                {"threadId": destination},
+                actor_role="management",
+                target_role="execution",
+                phase="management_dispatch_read_fallback",
+                action_id=f"{current.get('dispatchId')}:read",
+                dispatch_id=current.get("dispatchId"),
+            )
+            return self.plan_host_action(task_id, fallback, actor="management")
+        return snapshot
+
+    def record_migration_step(self, task_id: str, step: dict[str, Any], actor: str = "management") -> dict[str, Any]:
+        return self._append(task_id, "coordination.migration_step", {"step": step}, actor)
+
+    def request_delegation(self, task_id: str, parent_role: str, work_category: str, child_role: str | None = None) -> dict[str, Any]:
+        from coordination_policy import validate_delegation
+
+        decision = validate_delegation(parent_role, work_category, child_role)
+        if not decision["allowed"] or not decision["require"]["eventWriteAllowed"]:
+            raise WorkflowError(decision["require"]["reason"])
+        return self._append(task_id, "coordination.delegation_requested", {"decision": decision}, parent_role)
+
+    def migration_plan(
+        self,
+        old_management_id: str,
+        new_management_id: str,
+        target: dict[str, Any],
+        management_settings: dict[str, Any] | None = None,
+        user_settings: dict[str, Any] | None = None,
+        inheritance_evidence: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        return build_migration_sequence(
+            old_management_id,
+            new_management_id,
+            target,
+            management_settings=management_settings,
+            user_settings=user_settings,
+            inheritance_evidence=inheritance_evidence,
+        )
+
+    def update_supervision(self, task_id: str, dispatch_id: str, wait_result: dict[str, Any] | None = None, read_result: dict[str, Any] | None = None, actor: str = "management") -> dict[str, Any]:
+        plan = build_supervision_plan(dispatch_id, wait_result, read_result)
+        return self._append(task_id, "coordination.supervision_updated", {"plan": plan}, actor)
+
+    def coordination_policy(self) -> dict[str, Any]:
+        return coordination_policy_projection()
 
     def start_execution(self, task_id: str, actor: str = "execution") -> dict[str, Any]:
         return self._append(task_id, "execution.started", {}, actor)
@@ -998,7 +1407,23 @@ class WorkflowStore:
     def audit(self, task_id: str) -> dict[str, Any]:
         events = self.events(task_id)
         errors: list[str] = []
-        state: dict[str, Any] = {"status": "intake", "event_count": 0, "destination_ready": False, "handoff_complete": False, "handoff_accepted": False, "source_removal_requested": False, "independent_acceptance": False, "retention_dry_run_done": False, "retention_applied": False, "contract": self.contract(task_id)}
+        state: dict[str, Any] = {
+            "status": "intake",
+            "event_count": 0,
+            "destination_ready": False,
+            "handoff_complete": False,
+            "handoff_accepted": False,
+            "source_removal_requested": False,
+            "independent_acceptance": False,
+            "retention_dry_run_done": False,
+            "retention_applied": False,
+            "host_actions": [],
+            "migration_steps": [],
+            "migration": summarize_migration_steps([]),
+            "supervision": None,
+            "legacy_compatibility": False,
+            "contract": self.contract(task_id),
+        }
         for position, event in enumerate(events, start=1):
             try:
                 if event.get("task_id") != task_id:
@@ -1020,7 +1445,20 @@ class WorkflowStore:
             errors.append("contract.created must be first")
         if state.get("status") == "complete" and not state.get("independent_acceptance"):
             errors.append("complete without independent acceptance")
-        return {"ok": not errors, "task_id": task_id, "status": state["status"], "event_count": len(events), "errors": errors, "retention": retention_summary(self.root)}
+        return {
+            "ok": not errors,
+            "task_id": task_id,
+            "status": state["status"],
+            "event_count": len(events),
+            "errors": errors,
+            "hostActions": state.get("host_actions", []),
+            "migrationSteps": state.get("migration_steps", []),
+            "migration": state.get("migration", summarize_migration_steps([])),
+            "supervision": state.get("supervision"),
+            "legacyCompatibility": state.get("legacy_compatibility", False),
+            "coordinationPolicy": coordination_policy_projection(),
+            "retention": retention_summary(self.root),
+        }
 
 
 def _json_read_line(line: str) -> dict[str, Any]:
@@ -1126,10 +1564,70 @@ def next_action(snapshot: dict[str, Any], capability_inventory: Any | None = Non
     if status in {"planning", "destination_ready", "correction"}:
         return {"action": "dispatch_business_task"}
     if status == "dispatched":
-        return {"action": "start_execution"}
-    if status == "executing":
-        return {"action": "submit_execution_report"}
-    if status == "reviewing":
+        supervision = snapshot.get("supervision")
+        if isinstance(supervision, dict):
+            dispatch_id = supervision.get("dispatchId")
+            send = _dispatch_send_action(snapshot, dispatch_id)
+            if send and send.get("status") == "planned":
+                return {
+                    "action": "send_dispatch_host_action",
+                    "dispatchId": dispatch_id,
+                    "hostAction": send,
+                    "writeAllowed": True,
+                }
+            if send and send.get("status") == "failed":
+                return {"action": "stop", "reason": "dispatch send failed", "dispatchId": dispatch_id}
+            wait = _dispatch_wait_action(snapshot, dispatch_id)
+            if wait and wait.get("status") == "planned":
+                return {
+                    "action": "wait_dispatch_host_action",
+                    "dispatchId": dispatch_id,
+                    "hostAction": wait,
+                    "writeAllowed": False,
+                }
+            if wait and wait.get("status") == "failed":
+                read = _dispatch_read_action(snapshot, dispatch_id)
+                if read and read.get("status") == "planned":
+                    return {
+                        "action": "read_dispatch_fallback",
+                        "dispatchId": dispatch_id,
+                        "hostAction": read,
+                        "writeAllowed": False,
+                    }
+                if not read or read.get("status") != "observed":
+                    return {"action": "stop", "reason": "wait failed without observed read fallback", "dispatchId": dispatch_id}
+            if wait and wait.get("status") == "observed":
+                return {"action": "start_execution", "dispatchId": dispatch_id}
+            read = _dispatch_read_action(snapshot, dispatch_id)
+            if read and read.get("status") == "observed":
+                return {"action": "start_execution", "dispatchId": dispatch_id}
+            return {
+                "action": "supervise_dispatch",
+                "dispatchId": dispatch_id,
+                "nextAction": supervision.get("nextAction"),
+                "sequence": supervision.get("sequence", ["wait", "observe", "correct"]),
+                "failureClass": supervision.get("failureClass"),
+                "writeAllowed": supervision.get("writeAllowed", False),
+            }
+        return {"action": "dispatch_supervision_required", "reason": "canonical dispatch supervision is missing", "writeAllowed": False}
+    if status in {"executing", "reviewing"}:
+        supervision = snapshot.get("supervision")
+        if isinstance(supervision, dict):
+            dispatch_id = supervision.get("dispatchId")
+            wait = _dispatch_wait_action(snapshot, dispatch_id)
+            if wait and wait.get("status") == "failed":
+                read = _dispatch_read_action(snapshot, dispatch_id)
+                if read and read.get("status") == "planned":
+                    return {
+                        "action": "read_dispatch_fallback",
+                        "dispatchId": dispatch_id,
+                        "hostAction": read,
+                        "writeAllowed": False,
+                    }
+                if not read or read.get("status") != "observed":
+                    return {"action": "stop", "reason": "wait failed without observed read fallback", "dispatchId": dispatch_id}
+        if status == "executing":
+            return {"action": "submit_execution_report"}
         return {"action": "independent_review"}
     if status == "accepted":
         return {"action": "complete_task"}
@@ -1178,6 +1676,7 @@ def build_handoff_packet(
         "authorization": True,
         "redacted": True,
         "migrationPolicy": contract.get("migration_policy", {"enabled": False}),
+        "coordinationPolicy": coordination_policy_projection(),
     }
     if receipt:
         packet["destinationReceipt"] = {key: receipt.get(key) for key in ("skillName", "skillVersion", "role", "capabilityMode", "destinationId", "stableSessionId", "ready")}
@@ -1257,6 +1756,7 @@ def validate_install(skill_dir: str | Path) -> dict[str, Any]:
         root / "SKILL.md",
         root / "agents" / "openai.yaml",
         root / "scripts" / "workflow_engine.py",
+        root / "scripts" / "coordination_policy.py",
         root / "scripts" / "bootstrap.py",
         root / "scripts" / "retention.py",
         root / "scripts" / "session_migration.py",
@@ -1292,11 +1792,48 @@ def validate_install(skill_dir: str | Path) -> dict[str, Any]:
     return {"ok": not missing and not errors, "skillVersion": SKILL_VERSION, "missing": missing, "errors": errors}
 
 
+def quick_validate() -> dict[str, Any]:
+    """Run a small code-state validation used by bootstrap and CI smoke checks."""
+    checks = {
+        "project_target_schema": False,
+        "projectless_target_schema": False,
+        "coordination_projection": False,
+        "coordination_wait_timeout": False,
+    }
+    try:
+        validate_create_target({"type": "project", "projectId": "quick-validate", "environment": {"type": "local"}})
+        checks["project_target_schema"] = True
+        validate_create_target({"type": "projectless"})
+        checks["projectless_target_schema"] = True
+        projection = coordination_policy_projection()
+        checks["coordination_projection"] = bool(projection.get("hostActionSchemas"))
+        checks["coordination_wait_timeout"] = projection.get("defaultWaitTimeoutMs", 0) > 0
+    except CoordinationPolicyError:
+        pass
+    return {"ok": all(checks.values()), "checks": checks, "skillVersion": SKILL_VERSION, "externalReadsRequired": False}
+
+
 def run_selftest() -> dict[str, Any]:
     checks: dict[str, bool] = {}
     packaged_policy = load_policy(Path(__file__).resolve().parents[1], SKILL_VERSION)
     policy_validation = validate_policy(packaged_policy, SKILL_VERSION)
     checks["runtime_policy"] = policy_validation["ok"] and policy_validation["externalMarkdownRequired"] is False
+    migration = build_migration_sequence(
+        "old-management",
+        "new-management",
+        {"type": "projectless"},
+        management_settings={"model": "management-model", "locale": "zh-CN"},
+        user_settings={"locale": "en-US"},
+    )
+    checks["coordination_migration"] = validate_migration_sequence(migration)["ok"] and migration[2].get("settingsPolicy", {}).get("inherit_management") is True
+    checks["coordination_settings_merge"] = migration[2].get("settings", {}).get("settings") == {"model": "management-model", "locale": "en-US"}
+    checks["coordination_host_schema"] = migration[0]["args"] == {"threadId": "new-management", "prompt": "management handoff"} and "targetRole" not in migration[0]["args"]
+    checks["coordination_supervision"] = build_supervision_plan("dispatch", {"ok": False}, {"ok": True})["nextAction"] == "observe"
+    timeout_plan = build_supervision_plan("dispatch", {"timedOut": True})
+    turn_plan = build_supervision_plan("dispatch", {"timedOut": False, "wake": {"reason": "turnCompleted"}})
+    checks["coordination_wait_timeout_continue"] = timeout_plan["nextAction"] == "wait" and timeout_plan["reviewReady"] is False and timeout_plan["failureClass"] is None
+    checks["coordination_wait_turn_completed"] = turn_plan["nextAction"] == "observe" and turn_plan["reviewReady"] is True
+    checks["coordination_delegation_gate"] = validate_delegation("management", "implementation", "execution")["require"]["eventWriteAllowed"] is False
     with tempfile.TemporaryDirectory(prefix="uaw-selftest-") as temp:
         project = Path(temp) / "project"
         project.mkdir()
@@ -1333,6 +1870,12 @@ def run_selftest() -> dict[str, Any]:
         }
         store.destination_ready("demo", receipt, expected_role="execution", expected_destination_id="dest-1")
         store.dispatch("demo")
+        dispatch_state = store.state("demo")
+        dispatch_id = dispatch_state["supervision"]["dispatchId"]
+        send_action = _dispatch_send_action(dispatch_state, dispatch_id)
+        wait_action = _dispatch_wait_action(dispatch_state, dispatch_id)
+        store.record_host_action_result("demo", send_action["actionId"], "sent", {"ok": True, "messageId": "selftest-send"})
+        store.record_host_action_result("demo", wait_action["actionId"], "observed", {"ok": True, "observed": True})
         store.start_execution("demo")
         store.report("demo", report_ref="reports/demo.md")
         try:
@@ -1433,6 +1976,6 @@ def run_selftest() -> dict[str, Any]:
 __all__ = [
     "SKILL_NAME", "SKILL_VERSION", "STATES", "WorkflowError", "WorkflowStore", "build_handoff_packet",
     "detect_handoff_intent", "initialize_project", "make_contract", "next_action", "prepare_handoff",
-    "probe_capabilities", "redact_text", "render_status", "route_request", "run_selftest", "sensitive_match_count",
-    "validate_contract", "validate_install", "write_manual_handoff",
+    "probe_capabilities", "quick_validate", "redact_text", "render_status", "route_request", "run_selftest", "sensitive_match_count",
+    "validate_contract", "validate_install", "write_manual_handoff", "coordination_policy_projection",
 ]

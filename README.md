@@ -18,7 +18,7 @@ python packages/universal-agent-workflow/scripts/uaw.py validate-install \
 python packages/universal-agent-workflow/scripts/uaw.py selftest
 ```
 
-The first release is `0.0.1` and follows Semantic Versioning. Use the same version
+The current release is `0.0.2` and follows Semantic Versioning. Use the same version
 in a destination bootstrap packet and readiness receipt.
 
 One continuous user request is one release batch: collect all issues found
