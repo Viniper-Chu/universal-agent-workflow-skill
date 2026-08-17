@@ -62,12 +62,18 @@ The shortest migrated execution path is:
 ```text
 contract.created -> plan.created -> bootstrap.requested -> destination.ready
 -> handoff.requested -> handoff.bundle_received -> handoff.accepted
--> dispatch.requested -> execution.started -> execution.reported
+-> dispatch.requested -> coordination.supervision_updated
+-> host-action.planned(send) -> host-action.planned(wait)
+-> host-action.sent(send) -> execution.started
+-> host-action.observed(wait) -> execution.reported
 -> review.accepted -> completion.requested
 ```
 
-Correction and blocked transitions are explicit. A checkpoint cannot complete
-a task.
+The dispatch send must use the host adapter's `prompt` argument and be recorded
+as sent/observed before execution starts. Review/correction requires the same
+dispatch's observed wait; a failed wait requires an observed read-only
+`read_thread` fallback. Correction and blocked transitions are explicit. A
+checkpoint cannot complete a task.
 
 ## Source-session removal
 

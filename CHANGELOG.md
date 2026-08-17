@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.2
+
+- Added code-backed coordination policy for host-action states, ordered
+  management migration, settings inheritance evidence, supervision gates and
+  structured delegation requirements.
+- Bound canonical dispatch to management send (`prompt`) then wait, with
+  same-dispatch start/review evidence and read-only wait-failure fallback.
+- Added zero-write negative tests, CLI/audit projections, and explicit
+  execution-id evidence for migration-created threads.
+
 ## 0.0.1
 
 - Added contract-first planning and an event-backed lifecycle.

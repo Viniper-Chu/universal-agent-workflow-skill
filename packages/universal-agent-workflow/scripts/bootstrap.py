@@ -9,7 +9,7 @@ from typing import Any
 
 
 SKILL_NAME = "universal-agent-workflow"
-SKILL_VERSION = "0.0.1"
+SKILL_VERSION = "0.0.2"
 
 
 class BootstrapError(ValueError):

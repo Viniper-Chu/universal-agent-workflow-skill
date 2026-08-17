@@ -19,6 +19,7 @@ from workflow_engine import (
     next_action,
     prepare_handoff,
     probe_capabilities,
+    quick_validate,
     redact_json,
     redact_text,
     render_status,
@@ -26,6 +27,16 @@ from workflow_engine import (
     run_selftest,
     validate_install,
     sensitive_match_count,
+)
+from coordination_policy import (
+    CoordinationPolicyError,
+    build_host_action,
+    build_migration_sequence,
+    build_supervision_plan,
+    coordination_policy_projection,
+    derive_execution_settings,
+    validate_create_target,
+    validate_delegation,
 )
 from workflow_policy import WorkflowPolicyError, load_policy, policy_profile, validate_policy
 from source_policy_compiler import SourcePolicyCompilerError, compile_workflow_sources
@@ -78,6 +89,46 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--actor", default="management" if name in {"dispatch", "complete"} else "execution")
     dispatch = sub.choices["dispatch"]
     dispatch.add_argument("--packet-ref")
+
+    dispatch_supervised = sub.add_parser("dispatch-supervised", help="dispatch and enter wait/observe/correct supervision")
+    dispatch_supervised.add_argument("--project-root", default=".")
+    dispatch_supervised.add_argument("--output-root", default=".agent-workflow")
+    dispatch_supervised.add_argument("--task-id", required=True)
+    dispatch_supervised.add_argument("--dispatch-id", required=True)
+    dispatch_supervised.add_argument("--packet-ref")
+    dispatch_supervised.add_argument("--actor", default="management")
+
+    plan_host = sub.add_parser("plan-host-action", help="append a planned host action to task state")
+    plan_host.add_argument("--project-root", default=".")
+    plan_host.add_argument("--output-root", default=".agent-workflow")
+    plan_host.add_argument("--task-id", required=True)
+    plan_host.add_argument("--action-json", required=True)
+    plan_host.add_argument("--actor", default="management")
+
+    record_host = sub.add_parser("record-host-action", help="append a host action result to task state")
+    record_host.add_argument("--project-root", default=".")
+    record_host.add_argument("--output-root", default=".agent-workflow")
+    record_host.add_argument("--task-id", required=True)
+    record_host.add_argument("--action-id", required=True)
+    record_host.add_argument("--status", required=True, choices=["sent", "observed", "failed"])
+    record_host.add_argument("--result-json")
+    record_host.add_argument("--actor", default="management")
+
+    migration_step = sub.add_parser("migration-step", help="append one code-backed migration step")
+    migration_step.add_argument("--project-root", default=".")
+    migration_step.add_argument("--output-root", default=".agent-workflow")
+    migration_step.add_argument("--task-id", required=True)
+    migration_step.add_argument("--step-json", required=True)
+    migration_step.add_argument("--actor", default="management")
+
+    supervision_update = sub.add_parser("supervision-update", help="append wait/observe/correct supervision state")
+    supervision_update.add_argument("--project-root", default=".")
+    supervision_update.add_argument("--output-root", default=".agent-workflow")
+    supervision_update.add_argument("--task-id", required=True)
+    supervision_update.add_argument("--dispatch-id", required=True)
+    supervision_update.add_argument("--wait-json")
+    supervision_update.add_argument("--read-json")
+    supervision_update.add_argument("--actor", default="management")
 
     report = sub.add_parser("report", help="record an execution report")
     report.add_argument("--project-root", default=".")
@@ -232,6 +283,55 @@ def parser() -> argparse.ArgumentParser:
     policy.add_argument("--skill-dir", default=str(Path(__file__).resolve().parents[1]))
     policy.add_argument("--role", required=True, choices=["management", "execution", "reviewer"])
 
+    coordination_policy = sub.add_parser("coordination-policy", help="render the code-backed 0.0.2 coordination policy")
+
+    host_action = sub.add_parser("host-action", help="build a planned host action contract")
+    host_action.add_argument("--action-name", required=True)
+    host_action.add_argument("--tool", required=True)
+    host_action.add_argument("--args-json", default="{}")
+    host_action.add_argument("--actor-role", required=True)
+    host_action.add_argument("--target-role")
+    host_action.add_argument("--actor-session-id")
+    host_action.add_argument("--dispatch-id")
+    host_action.add_argument("--chain-id")
+    host_action.add_argument("--phase", required=True)
+    host_action.add_argument("--action-id")
+
+    host_action_result = sub.add_parser("host-action-result", help="record a host action result in a pure projection")
+    host_action_result.add_argument("--action-json", required=True)
+    host_action_result.add_argument("--status", required=True, choices=["planned", "sent", "observed", "failed"])
+    host_action_result.add_argument("--result-json")
+
+    migration_plan = sub.add_parser("migration-plan", help="render the code-backed management migration order")
+    migration_plan.add_argument("--old-management-id", required=True)
+    migration_plan.add_argument("--new-management-id", required=True)
+    migration_plan.add_argument("--target-json", required=True, help="exact codex_app__create_thread target object")
+    migration_plan.add_argument("--management-json", help="management settings snapshot object")
+    migration_plan.add_argument("--user-json", help="partial user settings override object")
+    migration_plan.add_argument("--inheritance-evidence-json", help="optional host inheritance evidence object")
+
+    settings_inherit = sub.add_parser("settings-inherit", help="derive execution settings without overriding user choice")
+    settings_inherit.add_argument("--management-json", required=True)
+    settings_inherit.add_argument("--user-json")
+
+    supervision = sub.add_parser("supervision", help="render wait/observe/correct supervision state")
+    supervision.add_argument("--dispatch-id", required=True)
+    supervision.add_argument("--wait-json")
+    supervision.add_argument("--read-json")
+
+    delegation = sub.add_parser("delegation-validate", help="validate structured parent-role delegation")
+    delegation.add_argument("--parent-role", required=True)
+    delegation.add_argument("--work-category", required=True)
+    delegation.add_argument("--child-role")
+
+    delegation_request = sub.add_parser("delegation-request", help="record an allowed structured delegation")
+    delegation_request.add_argument("--project-root", default=".")
+    delegation_request.add_argument("--output-root", default=".agent-workflow")
+    delegation_request.add_argument("--task-id", required=True)
+    delegation_request.add_argument("--parent-role", required=True)
+    delegation_request.add_argument("--work-category", required=True)
+    delegation_request.add_argument("--child-role")
+
     source_migrate = sub.add_parser("source-migrate", help="preserve three legacy workflow sources as structured non-runtime evidence")
     source_migrate.add_argument("--project-root", default=".")
     source_migrate.add_argument("--output-root", default=".agent-workflow")
@@ -280,6 +380,8 @@ def parser() -> argparse.ArgumentParser:
     validate = sub.add_parser("validate-install", help="validate a skill package")
     validate.add_argument("--skill-dir", default=str(Path(__file__).resolve().parents[1]))
 
+    sub.add_parser("quick_validate", aliases=["quick-validate"], help="run the code-backed quick validation checks")
+
     sub.add_parser("selftest", help="run built-in high-value lifecycle and routing tests")
     return root
 
@@ -297,6 +399,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if result["ok"] else 1
         if args.command == "validate-install":
             result = validate_install(args.skill_dir)
+            _json(result)
+            return 0 if result["ok"] else 1
+        if args.command in {"quick_validate", "quick-validate"}:
+            result = quick_validate()
             _json(result)
             return 0 if result["ok"] else 1
         if args.command == "probe":
@@ -323,6 +429,67 @@ def main(argv: list[str] | None = None) -> int:
                 "runtimePolicy": policy_profile(args.role, args.skill_dir, SKILL_VERSION),
                 "externalReadsRequired": False,
             })
+            return 0
+        if args.command == "coordination-policy":
+            _json({"ok": True, "command": "coordination-policy", "skillVersion": SKILL_VERSION, "coordinationPolicy": coordination_policy_projection(), "externalReadsRequired": False})
+            return 0
+        if args.command == "host-action":
+            _json({
+                "ok": True,
+                "command": "host-action",
+                "action": build_host_action(
+                    args.action_name,
+                    args.tool,
+                    json.loads(args.args_json),
+                    actor_role=args.actor_role,
+                    target_role=args.target_role,
+                    phase=args.phase,
+                    action_id=args.action_id,
+                    actor_session_id=args.actor_session_id,
+                    dispatch_id=args.dispatch_id,
+                    chain_id=args.chain_id,
+                ),
+                "externalReadsRequired": False,
+            })
+            return 0
+        if args.command == "host-action-result":
+            from coordination_policy import record_host_action
+
+            result = json.loads(args.result_json) if args.result_json else None
+            _json({"ok": True, "command": "host-action-result", "action": record_host_action(json.loads(args.action_json), args.status, result), "externalReadsRequired": False})
+            return 0
+        if args.command == "migration-plan":
+            target = json.loads(args.target_json)
+            validate_create_target(target)
+            management_settings = json.loads(args.management_json) if args.management_json else {}
+            user_settings = json.loads(args.user_json) if args.user_json else None
+            inheritance_evidence = json.loads(args.inheritance_evidence_json) if args.inheritance_evidence_json else None
+            _json({
+                "ok": True,
+                "command": "migration-plan",
+                "steps": build_migration_sequence(
+                    args.old_management_id,
+                    args.new_management_id,
+                    target,
+                    management_settings=management_settings,
+                    user_settings=user_settings,
+                    inheritance_evidence=inheritance_evidence,
+                ),
+                "externalReadsRequired": False,
+            })
+            return 0
+        if args.command == "settings-inherit":
+            management_settings = json.loads(args.management_json)
+            user_settings = json.loads(args.user_json) if args.user_json else None
+            _json({"ok": True, "command": "settings-inherit", "settings": derive_execution_settings(management_settings, user_settings), "externalReadsRequired": False})
+            return 0
+        if args.command == "supervision":
+            wait_result = json.loads(args.wait_json) if args.wait_json else None
+            read_result = json.loads(args.read_json) if args.read_json else None
+            _json({"ok": True, "command": "supervision", "plan": build_supervision_plan(args.dispatch_id, wait_result, read_result), "externalReadsRequired": False})
+            return 0
+        if args.command == "delegation-validate":
+            _json({"ok": True, "command": "delegation-validate", "decision": validate_delegation(args.parent_role, args.work_category, args.child_role), "externalReadsRequired": False})
             return 0
         if args.command == "source-migrate":
             running_skill_dir = Path(__file__).resolve().parents[1]
@@ -417,6 +584,27 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "dispatch":
             _json(store.dispatch(args.task_id, actor=args.actor, packet_ref=args.packet_ref))
+            return 0
+        if args.command == "dispatch-supervised":
+            _json(store.dispatch_with_supervision(args.task_id, args.dispatch_id, actor=args.actor, packet_ref=args.packet_ref))
+            return 0
+        if args.command == "plan-host-action":
+            _json(store.plan_host_action(args.task_id, json.loads(args.action_json), actor=args.actor))
+            return 0
+        if args.command == "record-host-action":
+            result = json.loads(args.result_json) if args.result_json else None
+            _json(store.record_host_action_result(args.task_id, args.action_id, args.status, result=result, actor=args.actor))
+            return 0
+        if args.command == "migration-step":
+            _json(store.record_migration_step(args.task_id, json.loads(args.step_json), actor=args.actor))
+            return 0
+        if args.command == "supervision-update":
+            wait_result = json.loads(args.wait_json) if args.wait_json else None
+            read_result = json.loads(args.read_json) if args.read_json else None
+            _json(store.update_supervision(args.task_id, args.dispatch_id, wait_result, read_result, actor=args.actor))
+            return 0
+        if args.command == "delegation-request":
+            _json(store.request_delegation(args.task_id, args.parent_role, args.work_category, args.child_role))
             return 0
         if args.command == "start":
             _json(store.start_execution(args.task_id, actor=args.actor))
@@ -527,7 +715,7 @@ def main(argv: list[str] | None = None) -> int:
             _json(store.rotate_retention(args.task_id, args.generation))
             return 0
         raise WorkflowError(f"unsupported command: {args.command}")
-    except (WorkflowError, BootstrapError, WorkflowPolicyError, SourcePolicyCompilerError, OSError, json.JSONDecodeError) as exc:
+    except (WorkflowError, BootstrapError, WorkflowPolicyError, CoordinationPolicyError, SourcePolicyCompilerError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"ok": False, "error": redact_text(str(exc))}, ensure_ascii=False), file=sys.stderr)
         return 2
 

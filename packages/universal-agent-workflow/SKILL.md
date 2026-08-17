@@ -58,9 +58,12 @@ on the desktop, or in a user home directory.
    `SOURCE_SESSION_REMOVED` with `removalMode=archive`. If neither exists,
    return `MANUAL_SESSION_REMOVAL_REQUIRED` with a precise manual instruction.
    A failed removal never writes a removed terminal state.
-8. Dispatch, execute, report, review, correct when needed, and obtain
-   independent acceptance. A checkpoint is not acceptance and a report alone
-   cannot complete a task.
+8. Dispatch through the canonical host-action sequence: management plans a
+   `prompt` send followed by `wait_threads`; record the send result before
+   execution starts. Review/correction requires same-dispatch wait observation,
+   or an observed read-only `read_thread` fallback after a failed wait. Then
+   report, review, correct when needed, and obtain independent acceptance. A
+   checkpoint is not acceptance and a report alone cannot complete a task.
 9. After management-confirmed handoff or independently accepted completion,
    let `next-action` drive retention dry-run, apply, and stop. Keep current,
    previous, and retained evidence; remove only registered older or ephemeral
@@ -80,7 +83,7 @@ intake -> planning -> bootstrap_pending -> destination_ready -> dispatched
 ```
 
 Correction returns to execution. A blocked task stays blocked until an
-explicit unblock. A valid receipt includes the Skill name and fixed `0.0.1`
+explicit unblock. A valid receipt includes the Skill name and fixed `0.0.2`
 version, destination role, install/resolve path or provider, passed selftest
 and quick validation, capability mode, stable destination identity when the
 host provides one, peer identity, and `ready=true`. “The prompt was received”
@@ -161,7 +164,7 @@ direct consumer; do not build a second state machine or parser in a consumer.
 
 Read `references/contract-schema.md` for the input shape and
 `references/protocol.md` for the event, receipt, relay, and retention
-protocols. The installed package version is `0.0.1`. Collect every issue found
+protocols. The installed package version is `0.0.2`. Collect every issue found
 while fulfilling one continuous user request into one release batch and bump
 the version only once after that batch is verified. Compatible fixes use a
 patch release; backward-compatible capabilities use a minor release; a major
