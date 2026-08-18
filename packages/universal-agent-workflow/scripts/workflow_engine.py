@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from bootstrap import BootstrapError, SKILL_NAME, SKILL_VERSION, make_bootstrap_packet, validate_readiness_receipt
+from package_manifest import inspect_skill_package, required_skill_files
 from handoff_bundle import (
     HandoffBundleError,
     build_code_handoff_bundle,
@@ -133,7 +134,9 @@ EVENT_ACTOR_ROLES: dict[str, set[str]] = {
     "retention.applied": {"management", "system"},
 }
 ACTORS = {"management", "execution", "reviewer", "host", "system"}
-LEGACY_SKILL_VERSIONS = {"0.0.1"}
+# Persisted contracts from the immediately previous release remain readable
+# while new contracts and receipts use the single current package version.
+LEGACY_SKILL_VERSIONS = {"0.0.1", "0.0.2"}
 
 
 class WorkflowError(RuntimeError):
@@ -326,7 +329,7 @@ def initialize_project(project_root: str | Path, output_root: str | Path = ".age
     return {"ok": True, "skillName": SKILL_NAME, "skillVersion": SKILL_VERSION, "outputRoot": str(root)}
 
 
-def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
+def _validate_contract(contract: dict[str, Any], *, allow_legacy: bool) -> dict[str, Any]:
     required = ("task_id", "title", "objective", "role", "complexity", "acceptance", "allowed_actions", "forbidden_actions")
     for key in required:
         if key not in contract:
@@ -348,9 +351,22 @@ def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
             raise WorkflowError("migration_policy must be an object with boolean enabled")
     contract.setdefault("skill_name", SKILL_NAME)
     contract.setdefault("skill_version", SKILL_VERSION)
-    if contract["skill_name"] != SKILL_NAME or contract["skill_version"] != SKILL_VERSION:
+    allowed_versions = {SKILL_VERSION, *LEGACY_SKILL_VERSIONS} if allow_legacy else {SKILL_VERSION}
+    if contract["skill_name"] != SKILL_NAME or contract["skill_version"] not in allowed_versions:
         raise WorkflowError("contract skill version mismatch")
     return contract
+
+
+def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    """Validate a new contract using only the current package version."""
+
+    return _validate_contract(contract, allow_legacy=False)
+
+
+def validate_persisted_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    """Read/replay an existing contract from a prior compatible release."""
+
+    return _validate_contract(contract, allow_legacy=True)
 
 
 def make_contract(
@@ -832,8 +848,9 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
         if not send or send.get("status") not in {"sent", "observed"}:
             if not legacy_lifecycle_start:
                 raise WorkflowError("execution start requires the current dispatch send action to be sent")
-        if not _dispatch_review_ready(state, dispatch_id) and not legacy_lifecycle_start:
-            raise WorkflowError("execution start requires current-dispatch wait observed or read fallback evidence")
+        # Start is unlocked by the same-dispatch management send.  The later
+        # wait/read observation remains a review and correction gate, but must
+        # not create a circular dependency that prevents execution beginning.
         return
     if event == "execution.reported":
         if status != "executing" or not _nonempty(payload.get("report_ref")):
@@ -910,7 +927,7 @@ class WorkflowStore:
         path = self._contract_path(task_id)
         if not path.exists():
             raise WorkflowError(f"unknown task: {task_id}")
-        return validate_contract(_json_read(path))
+        return validate_persisted_contract(_json_read(path))
 
     def events(self, task_id: str) -> list[dict[str, Any]]:
         self._ensure_initialized()
@@ -1577,6 +1594,8 @@ def next_action(snapshot: dict[str, Any], capability_inventory: Any | None = Non
                 }
             if send and send.get("status") == "failed":
                 return {"action": "stop", "reason": "dispatch send failed", "dispatchId": dispatch_id}
+            if send and send.get("status") in {"sent", "observed"}:
+                return {"action": "start_execution", "dispatchId": dispatch_id}
             wait = _dispatch_wait_action(snapshot, dispatch_id)
             if wait and wait.get("status") == "planned":
                 return {
@@ -1596,11 +1615,6 @@ def next_action(snapshot: dict[str, Any], capability_inventory: Any | None = Non
                     }
                 if not read or read.get("status") != "observed":
                     return {"action": "stop", "reason": "wait failed without observed read fallback", "dispatchId": dispatch_id}
-            if wait and wait.get("status") == "observed":
-                return {"action": "start_execution", "dispatchId": dispatch_id}
-            read = _dispatch_read_action(snapshot, dispatch_id)
-            if read and read.get("status") == "observed":
-                return {"action": "start_execution", "dispatchId": dispatch_id}
             return {
                 "action": "supervise_dispatch",
                 "dispatchId": dispatch_id,
@@ -1615,6 +1629,13 @@ def next_action(snapshot: dict[str, Any], capability_inventory: Any | None = Non
         if isinstance(supervision, dict):
             dispatch_id = supervision.get("dispatchId")
             wait = _dispatch_wait_action(snapshot, dispatch_id)
+            if wait and wait.get("status") == "planned":
+                return {
+                    "action": "wait_dispatch_host_action",
+                    "dispatchId": dispatch_id,
+                    "hostAction": wait,
+                    "writeAllowed": False,
+                }
             if wait and wait.get("status") == "failed":
                 read = _dispatch_read_action(snapshot, dispatch_id)
                 if read and read.get("status") == "planned":
@@ -1751,28 +1772,10 @@ def prepare_handoff(store: WorkflowStore, task_id: str, message: str, confirmed:
 
 def validate_install(skill_dir: str | Path) -> dict[str, Any]:
     root = Path(skill_dir).expanduser().resolve()
-    required = [
-        root / "VERSION",
-        root / "SKILL.md",
-        root / "agents" / "openai.yaml",
-        root / "scripts" / "workflow_engine.py",
-        root / "scripts" / "coordination_policy.py",
-        root / "scripts" / "bootstrap.py",
-        root / "scripts" / "retention.py",
-        root / "scripts" / "session_migration.py",
-        root / "scripts" / "handoff_bundle.py",
-        root / "scripts" / "workflow_policy.py",
-        root / "scripts" / "source_policy_compiler.py",
-        root / "assets" / "workflow-policy.json",
-        root / "scripts" / "uaw.py",
-        root / "references" / "contract-schema.md",
-        root / "references" / "protocol.md",
-    ]
-    missing = [str(path) for path in required if not path.exists()]
-    errors: list[str] = []
+    structural = inspect_skill_package(root, SKILL_VERSION)
+    missing = [str(root / relative) for relative in structural.get("missing", [])]
+    errors: list[str] = list(structural.get("errors", []))
     skill_text = (root / "SKILL.md").read_text(encoding="utf-8") if (root / "SKILL.md").exists() else ""
-    if (root / "VERSION").exists() and (root / "VERSION").read_text(encoding="utf-8").strip() != SKILL_VERSION:
-        errors.append("package VERSION does not match runtime Skill version")
     if skill_text.count("\n") + 1 > 500:
         errors.append("SKILL.md exceeds 500 lines")
     if "[TODO" in skill_text:
@@ -1789,7 +1792,14 @@ def validate_install(skill_dir: str | Path) -> dict[str, Any]:
             validate_policy(_json_read(policy_path), SKILL_VERSION)
         except (WorkflowPolicyError, json.JSONDecodeError) as exc:
             errors.append(str(exc))
-    return {"ok": not missing and not errors, "skillVersion": SKILL_VERSION, "missing": missing, "errors": errors}
+    return {
+        "ok": not missing and not errors,
+        "skillVersion": SKILL_VERSION,
+        "missing": missing,
+        "errors": errors,
+        "requiredFiles": required_skill_files(root),
+        "manifest": structural.get("manifest", []),
+    }
 
 
 def quick_validate() -> dict[str, Any]:

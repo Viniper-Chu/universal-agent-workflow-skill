@@ -83,7 +83,7 @@ intake -> planning -> bootstrap_pending -> destination_ready -> dispatched
 ```
 
 Correction returns to execution. A blocked task stays blocked until an
-explicit unblock. A valid receipt includes the Skill name and fixed `0.0.2`
+explicit unblock. A valid receipt includes the Skill name and fixed `0.0.3`
 version, destination role, install/resolve path or provider, passed selftest
 and quick validation, capability mode, stable destination identity when the
 host provides one, peer identity, and `ready=true`. “The prompt was received”
@@ -164,7 +164,7 @@ direct consumer; do not build a second state machine or parser in a consumer.
 
 Read `references/contract-schema.md` for the input shape and
 `references/protocol.md` for the event, receipt, relay, and retention
-protocols. The installed package version is `0.0.2`. Collect every issue found
+protocols. The installed package version is `0.0.3`. Collect every issue found
 while fulfilling one continuous user request into one release batch and bump
 the version only once after that batch is verified. Compatible fixes use a
 patch release; backward-compatible capabilities use a minor release; a major

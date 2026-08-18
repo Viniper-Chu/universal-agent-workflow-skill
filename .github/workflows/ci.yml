@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   python:
     runs-on: ubuntu-latest
@@ -20,3 +23,35 @@ jobs:
         run: python packages/universal-agent-workflow/scripts/uaw.py selftest
       - name: Skill install validation
         run: python packages/universal-agent-workflow/scripts/uaw.py validate-install --skill-dir packages/universal-agent-workflow
+
+  release-asset:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: python
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Read package version
+        id: skill-version
+        shell: bash
+        run: echo "version=$(tr -d '\r\n' < packages/universal-agent-workflow/VERSION)" >> "$GITHUB_OUTPUT"
+      - name: Verify tag matches package version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          version="${{ steps.skill-version.outputs.version }}"
+          test "$TAG_NAME" = "v$version" || {
+            echo "tag $TAG_NAME does not match package VERSION $version"
+            exit 1
+          }
+      - name: Build complete Skill release asset
+        run: python packages/universal-agent-workflow/scripts/build_release_asset.py --output "dist/universal-agent-workflow-${{ steps.skill-version.outputs.version }}.zip" --tag-name "${{ github.ref_name }}"
+      - name: Attach asset to the tag Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/universal-agent-workflow-*.zip

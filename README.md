@@ -18,7 +18,7 @@ python packages/universal-agent-workflow/scripts/uaw.py validate-install \
 python packages/universal-agent-workflow/scripts/uaw.py selftest
 ```
 
-The current release is `0.0.2` and follows Semantic Versioning. Use the same version
+The current release is `0.0.3` and follows Semantic Versioning. Use the same version
 in a destination bootstrap packet and readiness receipt.
 
 One continuous user request is one release batch: collect all issues found
@@ -27,6 +27,36 @@ one version update. Compatible fixes increment the patch version;
 backward-compatible capabilities increment the minor version; a major version
 requires explicit user authorization. Intermediate commits and pull requests
 do not create extra versions.
+
+## Release asset install/update
+
+The official asset is
+`https://github.com/Viniper-Chu/universal-agent-workflow-skill/releases/download/v0.0.3/universal-agent-workflow-0.0.3.zip`.
+Download it into a controlled directory, then run the packaged CLI through the
+same code path for a fresh install or an existing target update:
+
+```text
+curl -L <asset-url> -o universal-agent-workflow-0.0.3.zip
+python <uaw-runner>/scripts/uaw.py install \
+  --source universal-agent-workflow-0.0.3.zip \
+  --target <skill-dir> --backup-root <controlled-backups>
+python <skill-dir>/scripts/uaw.py validate-install --skill-dir <skill-dir>
+python <skill-dir>/scripts/uaw.py selftest
+python <skill-dir>/scripts/uaw.py destination-bootstrap \
+  --skill-dir <skill-dir> --role execution \
+  --destination-id <destination-id> --stable-session-id <stable-session-id> \
+  --peer-identity <management-peer> \
+  --tools codex_app__create_thread codex_app__send_message_to_thread \
+  codex_app__wait_threads codex_app__read_thread \
+  codex_app__set_thread_archived codex_app__navigate_to_codex_page
+```
+
+`deploy` is the CLI alias for `install`. The installer validates the complete
+manifest before a recoverable replacement, distinguishes `install_required`,
+`update_required`, `already_exact/current`, and `repair_required`, and refuses
+to mutate a linked target that needs repair. The bootstrap receipt is the final
+code-generated readiness check; a downloaded file or prompt alone is not proof
+that a destination adopted the Skill.
 
 ## Quick start
 

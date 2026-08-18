@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from bootstrap import BootstrapError, SKILL_VERSION, installation_plan, make_verified_readiness_receipt, validate_readiness_receipt
+from deployment import DeploymentError, build_release_asset, deploy_skill
 from retention import verify_git_current
 from workflow_engine import (
     WorkflowError,
@@ -279,11 +280,22 @@ def parser() -> argparse.ArgumentParser:
     install.add_argument("--source", required=True)
     install.add_argument("--version", default=SKILL_VERSION)
 
+    deploy = sub.add_parser("install", aliases=["deploy"], help="validate and recoverably install/update/repair one exact Skill target")
+    deploy.add_argument("--source", required=True)
+    deploy.add_argument("--target", required=True)
+    deploy.add_argument("--backup-root")
+    deploy.add_argument("--version", default=SKILL_VERSION)
+
+    release_asset = sub.add_parser("build-release-asset", help="build a complete directly installable Skill release zip")
+    release_asset.add_argument("--source", default=str(Path(__file__).resolve().parents[1]))
+    release_asset.add_argument("--output", required=True)
+    release_asset.add_argument("--version", default=SKILL_VERSION)
+
     policy = sub.add_parser("policy", help="validate and render the code-backed runtime policy for one role")
     policy.add_argument("--skill-dir", default=str(Path(__file__).resolve().parents[1]))
     policy.add_argument("--role", required=True, choices=["management", "execution", "reviewer"])
 
-    coordination_policy = sub.add_parser("coordination-policy", help="render the code-backed 0.0.2 coordination policy")
+    coordination_policy = sub.add_parser("coordination-policy", help="render the code-backed current coordination policy")
 
     host_action = sub.add_parser("host-action", help="build a planned host action contract")
     host_action.add_argument("--action-name", required=True)
@@ -418,6 +430,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "install-plan":
             _json(installation_plan(args.target, args.source, args.version))
+            return 0
+        if args.command in {"install", "deploy"}:
+            result = deploy_skill(args.source, args.target, expected_version=args.version, backup_root=args.backup_root)
+            _json(result)
+            return 0 if result.get("ok") else 1
+        if args.command == "build-release-asset":
+            _json(build_release_asset(args.source, args.output, expected_version=args.version))
             return 0
         if args.command == "policy":
             policy_value = load_policy(args.skill_dir, SKILL_VERSION)
@@ -715,7 +734,7 @@ def main(argv: list[str] | None = None) -> int:
             _json(store.rotate_retention(args.task_id, args.generation))
             return 0
         raise WorkflowError(f"unsupported command: {args.command}")
-    except (WorkflowError, BootstrapError, WorkflowPolicyError, CoordinationPolicyError, SourcePolicyCompilerError, OSError, json.JSONDecodeError) as exc:
+    except (WorkflowError, BootstrapError, DeploymentError, WorkflowPolicyError, CoordinationPolicyError, SourcePolicyCompilerError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"ok": False, "error": redact_text(str(exc))}, ensure_ascii=False), file=sys.stderr)
         return 2
 

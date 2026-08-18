@@ -3,13 +3,10 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
-
-SKILL_NAME = "universal-agent-workflow"
-SKILL_VERSION = "0.0.2"
+from package_manifest import SKILL_NAME, SKILL_VERSION, inspect_skill_package
 
 
 class BootstrapError(ValueError):
@@ -99,23 +96,47 @@ def validate_readiness_receipt(
 
 
 def installation_plan(target: str | Path, source: str | Path, expected_version: str = SKILL_VERSION) -> dict[str, Any]:
-    """Return a non-destructive deployment plan; never silently overwrite."""
+    """Return a non-destructive four-state deployment plan.
+
+    The source and target are independently checked against the shared
+    structural manifest.  A same-version but incomplete target is therefore
+    repairable rather than incorrectly reported as current.
+    """
     target_path = Path(target).expanduser()
     source_path = Path(source).expanduser()
     if not source_path.exists():
         raise BootstrapError("Skill install source does not exist")
-    existing_version = None
-    version_file = target_path / "VERSION"
-    skill_file = target_path / "SKILL.md"
-    if version_file.exists():
-        existing_version = version_file.read_text(encoding="utf-8").strip()
-    elif skill_file.exists():
-        match = re.search(r"skillVersion\s*[:=]\s*['\"]?([0-9]+\.[0-9]+\.[0-9]+)", skill_file.read_text(encoding="utf-8"))
-        existing_version = match.group(1) if match else "unknown"
-    if existing_version and existing_version != expected_version:
-        return {"ok": False, "action": "update_required", "target": str(target_path), "existingVersion": existing_version, "expectedVersion": expected_version, "source": str(source_path)}
-    action = "already_exact" if existing_version == expected_version else "install_or_link"
-    return {"ok": True, "action": action, "target": str(target_path), "existingVersion": existing_version, "expectedVersion": expected_version, "source": str(source_path), "overwrite": False}
+    source_validation = inspect_skill_package(source_path, expected_version)
+    target_validation = inspect_skill_package(target_path, expected_version) if target_path.exists() else {
+        "ok": False,
+        "source": str(target_path),
+        "sourceType": "missing",
+        "version": None,
+        "missing": ["<package>"],
+        "errors": ["target does not exist"],
+        "manifest": [],
+    }
+    existing_version = target_validation.get("version")
+    if not target_path.exists():
+        action, state = "install_required", "missing"
+    elif existing_version and existing_version != expected_version:
+        action, state = "update_required", "update_required"
+    elif target_validation.get("ok") is True:
+        action, state = "already_exact", "current"
+    else:
+        action, state = "repair_required", "repair_required"
+    return {
+        "ok": bool(source_validation.get("ok")),
+        "action": action,
+        "state": state,
+        "target": str(target_path),
+        "existingVersion": existing_version,
+        "expectedVersion": expected_version,
+        "source": str(source_path),
+        "sourceValidation": source_validation,
+        "targetValidation": target_validation,
+        "overwrite": False,
+    }
 
 
 def make_readiness_receipt(

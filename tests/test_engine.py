@@ -71,6 +71,27 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertFalse(store._task_state_path("atomic-task").exists())
         self.assertEqual(store.events("atomic-task"), [])
 
+    def test_legacy_contract_is_readable_but_new_legacy_contract_is_rejected(self):
+        temp, project, store = self.make_store()
+        self.addCleanup(temp.cleanup)
+
+        persisted = make_contract("legacy-read", "Legacy read", "replay a persisted contract")
+        store.create_contract(persisted)
+        persisted["skill_version"] = "0.0.2"
+        store._contract_path("legacy-read").write_text(json.dumps(persisted), encoding="utf-8")
+        self.assertEqual(store.contract("legacy-read")["skill_version"], "0.0.2")
+        store.plan("legacy-read", persisted["plan_steps"])
+        self.assertEqual(store.state("legacy-read")["event_count"], 2)
+
+        imported = make_contract("legacy-create", "Legacy create", "reject an old new contract")
+        imported["skill_version"] = "0.0.2"
+        events_before = store.events_path.read_text(encoding="utf-8")
+        with self.assertRaisesRegex(WorkflowError, "contract skill version mismatch"):
+            store.create_contract(imported)
+        self.assertFalse(store._contract_path("legacy-create").exists())
+        self.assertEqual(store.events_path.read_text(encoding="utf-8"), events_before)
+        self.assertEqual(make_contract("current", "Current", "write current version")["skill_version"], SKILL_VERSION)
+
     def test_destination_events_are_signed_by_contract_destination_role(self):
         temp, project, store = self.make_store()
         self.addCleanup(temp.cleanup)
@@ -726,17 +747,15 @@ class WorkflowEngineTests(unittest.TestCase):
                 store.record_host_action_result("task", send["actionId"], "sent", {"ok": True}, actor="host")
             self.assertEqual(len(store.events("task")), before)
             store.record_host_action_result("task", send["actionId"], "sent", {"ok": True})
+            self.assertEqual(next_action(store.snapshot("task"))["action"], "start_execution")
+            store.start_execution("task")
             self.assertEqual(next_action(store.snapshot("task"))["action"], "wait_dispatch_host_action")
             before = len(store.events("task"))
-            with self.assertRaises(WorkflowError):
-                store.start_execution("task")
-            self.assertEqual(len(store.events("task")), before)
             with self.assertRaises(WorkflowError):
                 store.record_host_action_result("task", wait["actionId"], "observed", {"timedOut": True})
             self.assertEqual(len(store.events("task")), before)
             self.assertEqual(next_action(store.snapshot("task"))["action"], "wait_dispatch_host_action")
             store.record_host_action_result("task", wait["actionId"], "observed", {"timedOut": False, "wake": {"reason": "turnCompleted"}})
-            store.start_execution("task")
             store.report("task", report_ref="reports/task.md")
             store.review("task", "correction", reason="wait now observed")
             self.assertEqual(store.state("task")["status"], "correction")
@@ -751,14 +770,12 @@ class WorkflowEngineTests(unittest.TestCase):
                 send2 = next(item for item in state2["host_actions"] if item["action"] == "send_message")
                 wait2 = next(item for item in state2["host_actions"] if item["action"] == "wait_threads")
                 store2.record_host_action_result("task", send2["actionId"], "sent", {"ok": True})
+                store2.start_execution("task")
                 store2.record_host_action_result("task", wait2["actionId"], "failed", {"ok": False, "error": "wait unavailable"})
                 read = next(item for item in store2.state("task")["host_actions"] if item["action"] == "read_thread")
                 before = len(store2.events("task"))
-                with self.assertRaises(WorkflowError):
-                    store2.start_execution("task")
                 self.assertEqual(len(store2.events("task")), before)
                 store2.record_host_action_result("task", read["actionId"], "observed", {"ok": True, "snapshot": "state"})
-                store2.start_execution("task")
                 store2.report("task", report_ref="reports/task.md")
                 store2.review("task", "correction", reason="read observed")
                 self.assertEqual(store2.state("task")["status"], "correction")

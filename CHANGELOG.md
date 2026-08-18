@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.0.3
+
+- Added one complete package manifest shared by installation planning,
+  validation, recoverable deployment, and Release asset construction, with
+  explicit missing/update/current/repair states.
+- Added candidate-first deployment with same-filesystem backup/restore,
+  lexical target paths, junction/reparse fail-closed handling, and zero-write
+  invalid-candidate checks.
+- Added a directly installable Release zip and a tag gate requiring
+  `v<package VERSION>` before build or publication.
+- Added strict current-version writes while allowing only read/replay of
+  persisted 0.0.1/0.0.2 contracts.
+- Corrected native dispatch supervision so management send results unlock
+  execution while wait/read observation remains the review/correction gate.
+
 ## 0.0.2
 
 - Added code-backed coordination policy for host-action states, ordered
