@@ -41,6 +41,12 @@ from coordination_policy import (
 )
 from workflow_policy import WorkflowPolicyError, load_policy, policy_profile, validate_policy
 from source_policy_compiler import SourcePolicyCompilerError, compile_workflow_sources
+from repair_policy import (
+    RepairPolicyError,
+    build_repair_policy,
+    evaluate_repair_evidence,
+    repair_policy_projection,
+)
 
 
 def _configure_utf8_stdio() -> None:
@@ -80,6 +86,8 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument("--objective")
     plan.add_argument("--role", default="management", choices=["management", "execution", "reviewer"])
     plan.add_argument("--complexity", default="simple", choices=["simple", "complex"])
+    plan.add_argument("--work-type", choices=["general", "repair"])
+    plan.add_argument("--repair-policy-file")
     plan.add_argument("--actor", default="management")
 
     for name, help_text in (("dispatch", "request execution dispatch"), ("start", "start execution"), ("complete", "complete after acceptance")):
@@ -137,6 +145,7 @@ def parser() -> argparse.ArgumentParser:
     report.add_argument("--task-id", required=True)
     report.add_argument("--report-ref")
     report.add_argument("--report-text")
+    report.add_argument("--repair-evidence-file")
     report.add_argument("--actor", default="execution")
 
     review = sub.add_parser("review", help="record independent review or correction")
@@ -297,6 +306,18 @@ def parser() -> argparse.ArgumentParser:
 
     coordination_policy = sub.add_parser("coordination-policy", help="render the code-backed current coordination policy")
 
+    repair_policy = sub.add_parser("repair-policy", help="build a code-backed repair completion policy")
+    repair_policy.add_argument("--data-recovery-required", action="store_true")
+    repair_policy.add_argument("--real-data-write", action="store_true")
+    repair_policy.add_argument("--identity-key", action="append", default=[])
+    repair_policy.add_argument("--validation-check", action="append", default=[])
+    repair_policy.add_argument("--conservation-scope", action="append", default=[])
+    repair_policy.add_argument("--preserve-external-call-ledger", action="store_true")
+
+    repair_evidence = sub.add_parser("repair-evidence", help="evaluate repair evidence without writing task state")
+    repair_evidence.add_argument("--policy-file", required=True)
+    repair_evidence.add_argument("--evidence-file", required=True)
+
     host_action = sub.add_parser("host-action", help="build a planned host action contract")
     host_action.add_argument("--action-name", required=True)
     host_action.add_argument("--tool", required=True)
@@ -452,6 +473,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "coordination-policy":
             _json({"ok": True, "command": "coordination-policy", "skillVersion": SKILL_VERSION, "coordinationPolicy": coordination_policy_projection(), "externalReadsRequired": False})
             return 0
+        if args.command == "repair-policy":
+            value = build_repair_policy(
+                data_recovery_required=args.data_recovery_required,
+                real_data_write=args.real_data_write,
+                identity_keys=args.identity_key,
+                validation_checks=args.validation_check,
+                conservation_scopes=args.conservation_scope,
+                preserve_external_call_ledger=args.preserve_external_call_ledger,
+            )
+            _json({"ok": True, "command": "repair-policy", "skillVersion": SKILL_VERSION, "repairPolicy": value, "projection": repair_policy_projection(), "externalReadsRequired": False})
+            return 0
+        if args.command == "repair-evidence":
+            result = evaluate_repair_evidence(_read_json_file(args.policy_file), _read_json_file(args.evidence_file))
+            _json({"ok": True, "command": "repair-evidence", "skillVersion": SKILL_VERSION, "result": result, "externalReadsRequired": False})
+            return 0 if result["complete"] else 2
         if args.command == "host-action":
             _json({
                 "ok": True,
@@ -580,7 +616,16 @@ def main(argv: list[str] | None = None) -> int:
                 missing = [name for name in ("task_id", "title", "objective") if not getattr(args, name)]
                 if missing:
                     raise WorkflowError("plan requires --contract-json or " + ", ".join(f"--{name}" for name in missing))
-                contract = make_contract(task_id=args.task_id, title=args.title, objective=args.objective, role=args.role, complexity=args.complexity)
+                repair_policy_value = _read_json_file(args.repair_policy_file) if args.repair_policy_file else None
+                contract = make_contract(
+                    task_id=args.task_id,
+                    title=args.title,
+                    objective=args.objective,
+                    role=args.role,
+                    complexity=args.complexity,
+                    repair_policy=repair_policy_value,
+                    work_type=args.work_type,
+                )
             if not contract.get("plan_steps"):
                 complexity = contract.get("complexity", "simple")
                 contract["plan_steps"] = ["plan", "dispatch", "execute", "report", "review", "accept"] if complexity == "complex" else ["plan", "execute", "review"]
@@ -595,8 +640,10 @@ def main(argv: list[str] | None = None) -> int:
                     "objective": contract["objective"],
                     "role": contract["role"],
                     "complexity": contract["complexity"],
+                    "work_type": contract.get("work_type"),
                     "plan_steps": contract["plan_steps"],
                     "destination_role": contract.get("destination_role"),
+                    "repair_policy": contract.get("repair_policy"),
                 },
                 "snapshot": snapshot,
             })
@@ -629,7 +676,8 @@ def main(argv: list[str] | None = None) -> int:
             _json(store.start_execution(args.task_id, actor=args.actor))
             return 0
         if args.command == "report":
-            _json(store.report(args.task_id, report_ref=args.report_ref, report_text=args.report_text, actor=args.actor))
+            repair_evidence_value = _read_json_file(args.repair_evidence_file) if args.repair_evidence_file else None
+            _json(store.report(args.task_id, report_ref=args.report_ref, report_text=args.report_text, repair_evidence=repair_evidence_value, actor=args.actor))
             return 0
         if args.command == "review":
             _json(store.review(args.task_id, args.decision, actor=args.actor, independent=args.independent, checkpoint=args.checkpoint, reason=args.reason))
@@ -734,7 +782,7 @@ def main(argv: list[str] | None = None) -> int:
             _json(store.rotate_retention(args.task_id, args.generation))
             return 0
         raise WorkflowError(f"unsupported command: {args.command}")
-    except (WorkflowError, BootstrapError, DeploymentError, WorkflowPolicyError, CoordinationPolicyError, SourcePolicyCompilerError, OSError, json.JSONDecodeError) as exc:
+    except (WorkflowError, BootstrapError, DeploymentError, WorkflowPolicyError, CoordinationPolicyError, RepairPolicyError, SourcePolicyCompilerError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"ok": False, "error": redact_text(str(exc))}, ensure_ascii=False), file=sys.stderr)
         return 2
 

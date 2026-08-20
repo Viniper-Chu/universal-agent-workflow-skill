@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.0
+
+- Added a code-backed repair contract that separates product root-cause
+  closure from recovery of already affected data or artifacts.
+- Added structured repair evidence for original-failure reproduction, first
+  faulty production layer, shared fix, red-green regression and direct
+  consumers; final acceptance now rejects data-only remediation.
+- Added optional recovery gates for isolated production-chain candidates,
+  current identity rebinding, shared validator recomputation, snapshot-first
+  zero-write real-data mutation, non-target conservation scopes and external
+  call ledger preservation.
+- Added CLI builders/evaluators, event-backed outcome projection, handoff
+  continuity, negative acceptance tests and complete package validation for
+  the new repair policy module.
+
 ## 0.0.3
 
 - Added one complete package manifest shared by installation planning,

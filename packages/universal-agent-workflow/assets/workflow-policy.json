@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "policyName": "universal-agent-workflow-runtime-policy",
-  "policyVersion": "0.0.3",
+  "policyVersion": "0.1.0",
   "runtimeAuthority": "code-state",
   "externalMarkdownRequired": false,
   "rules": [
@@ -88,6 +88,30 @@
       "appliesTo": ["management", "execution", "reviewer"],
       "enforcement": "state-machine",
       "text": "A checkpoint, report or local fake is not final acceptance."
+    },
+    {
+      "id": "repair-root-cause-first",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "repair-policy",
+      "text": "A repair completes only after the original failure, first faulty production layer, shared root-cause fix, red-green regression and direct consumers are proven."
+    },
+    {
+      "id": "repair-data-recovery-separation",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "repair-policy",
+      "text": "Recovery of already affected state is tracked separately and can never substitute for product root-cause closure."
+    },
+    {
+      "id": "repair-safe-rebuild",
+      "appliesTo": ["management", "execution"],
+      "enforcement": "repair-policy",
+      "text": "When recovery is required, validate an isolated production-chain candidate, rebind current identities, rerun shared validators, and require snapshot-first zero-write guarded mutation for real data."
+    },
+    {
+      "id": "repair-conservation-acceptance",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "repair-policy",
+      "text": "Acceptance requires configured non-target conservation scopes and any configured external-call ledger to remain accounted for."
     },
     {
       "id": "source-session-removal",

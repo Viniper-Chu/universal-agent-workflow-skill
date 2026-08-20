@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Code-backed coordination contracts for the 0.0.3 release batch.
+"""Code-backed coordination contracts for the 0.1.0 release batch.
 
 The module owns the native host-action argument schemas, migration identity
 chain, settings policy, supervision fallback, and role delegation rules.

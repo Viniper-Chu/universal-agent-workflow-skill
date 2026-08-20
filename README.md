@@ -18,7 +18,7 @@ python packages/universal-agent-workflow/scripts/uaw.py validate-install \
 python packages/universal-agent-workflow/scripts/uaw.py selftest
 ```
 
-The current release is `0.0.3` and follows Semantic Versioning. Use the same version
+The current release is `0.1.0` and follows Semantic Versioning. Use the same version
 in a destination bootstrap packet and readiness receipt.
 
 One continuous user request is one release batch: collect all issues found
@@ -31,14 +31,14 @@ do not create extra versions.
 ## Release asset install/update
 
 The official asset is
-`https://github.com/Viniper-Chu/universal-agent-workflow-skill/releases/download/v0.0.3/universal-agent-workflow-0.0.3.zip`.
+`https://github.com/Viniper-Chu/universal-agent-workflow-skill/releases/download/v0.1.0/universal-agent-workflow-0.1.0.zip`.
 Download it into a controlled directory, then run the packaged CLI through the
 same code path for a fresh install or an existing target update:
 
 ```text
-curl -L <asset-url> -o universal-agent-workflow-0.0.3.zip
+curl -L <asset-url> -o universal-agent-workflow-0.1.0.zip
 python <uaw-runner>/scripts/uaw.py install \
-  --source universal-agent-workflow-0.0.3.zip \
+  --source universal-agent-workflow-0.1.0.zip \
   --target <skill-dir> --backup-root <controlled-backups>
 python <skill-dir>/scripts/uaw.py validate-install --skill-dir <skill-dir>
 python <skill-dir>/scripts/uaw.py selftest
@@ -79,6 +79,27 @@ Before retiring legacy workflow documents, `source-migrate` records every
 non-blank line as redacted structured evidence inside the controlled project
 root and verifies the packaged runtime policy. That evidence is non-runtime;
 new sessions continue from the JSON code-state handoff instead.
+
+## Repair completion
+
+Generate a structured repair policy instead of treating a corrected record as
+proof that the software improved:
+
+```text
+python packages/universal-agent-workflow/scripts/uaw.py repair-policy \
+  --data-recovery-required --real-data-write \
+  --identity-key "source identity" --identity-key "current tuple" \
+  --validation-check quality --validation-check projection \
+  --conservation-scope target --conservation-scope non-target \
+  --preserve-external-call-ledger
+```
+
+Attach the generated object to a contract with `work_type=repair` (or pass it
+to `plan --repair-policy-file`, which infers that work type), then pass a JSON evidence
+file to `report --repair-evidence-file <path>`. The engine independently
+projects `productRootCauseClosed` and `dataRecovered`. It allows incomplete
+reports to enter correction review, but refuses final acceptance when only
+the existing data or artifact was repaired.
 
 Use `references/contract-schema.md` and `references/protocol.md` for packet
 and lifecycle details.

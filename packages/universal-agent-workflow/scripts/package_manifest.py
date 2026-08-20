@@ -26,6 +26,7 @@ REQUIRED_SKILL_FILES: tuple[str, ...] = (
     "agents/openai.yaml",
     "scripts/workflow_engine.py",
     "scripts/coordination_policy.py",
+    "scripts/repair_policy.py",
     "scripts/bootstrap.py",
     "scripts/retention.py",
     "scripts/session_migration.py",

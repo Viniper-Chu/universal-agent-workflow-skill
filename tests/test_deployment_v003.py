@@ -29,7 +29,7 @@ class DeploymentV003Tests(unittest.TestCase):
     def test_version_sources_are_consistent(self):
         with (ROOT / "pyproject.toml").open("rb") as handle:
             project_version = tomllib.load(handle)["project"]["version"]
-        self.assertEqual(SKILL_VERSION, "0.0.3")
+        self.assertEqual(SKILL_VERSION, "0.1.0")
         self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), SKILL_VERSION)
         self.assertEqual((PACKAGE / "VERSION").read_text(encoding="utf-8").strip(), SKILL_VERSION)
         self.assertEqual(project_version, SKILL_VERSION)
@@ -145,13 +145,13 @@ class DeploymentV003Tests(unittest.TestCase):
             for index, member in enumerate(("../VERSION", "/VERSION", "C:/VERSION")):
                 malicious = root / f"malicious-{index}.zip"
                 with zipfile.ZipFile(malicious, "w") as archive:
-                    archive.writestr(member, "0.0.3")
+                    archive.writestr(member, SKILL_VERSION)
                 rejected = deploy_skill(malicious, target, backup_root=root / "evidence")
                 self.assertFalse(rejected["ok"])
                 self.assertTrue(rejected["targetUnchanged"])
                 self.assertIn("path", " ".join(rejected.get("errors", [])))
             self.assertEqual((target / "VERSION").read_text(encoding="utf-8").strip(), "0.0.2")
-            self.assertEqual(validate_release_tag("v0.0.3")["version"], "0.0.3")
+            self.assertEqual(validate_release_tag(f"v{SKILL_VERSION}")["version"], SKILL_VERSION)
             with self.assertRaisesRegex(ValueError, "does not match"):
                 validate_release_tag("v0.0.2")
 
@@ -159,10 +159,10 @@ class DeploymentV003Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="uaw-v003-release-") as raw:
             root = Path(raw)
             source = self.copy_package(root / "source")
-            asset = root / "dist" / "universal-agent-workflow-0.0.3.zip"
+            asset = root / "dist" / f"universal-agent-workflow-{SKILL_VERSION}.zip"
             result = build_release_asset(source, asset)
             self.assertTrue(result["ok"])
-            self.assertEqual(result["version"], "0.0.3")
+            self.assertEqual(result["version"], SKILL_VERSION)
             self.assertTrue(set(REQUIRED_SKILL_FILES).issubset(set(result["manifest"])))
             archive_validation = inspect_skill_package(asset)
             self.assertTrue(archive_validation["ok"])

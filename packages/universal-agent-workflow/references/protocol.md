@@ -75,6 +75,23 @@ dispatch's observed wait; a failed wait requires an observed read-only
 `read_thread` fallback. Correction and blocked transitions are explicit. A
 checkpoint cannot complete a task.
 
+## Repair evidence
+
+For a contract with `repair_policy`, every `execution.reported` event carries
+code-validated `repairEvidence`. The engine derives two independent values:
+`productRootCauseClosed` and `dataRecovered`. Incomplete evidence is allowed
+for correction or checkpoint review, but `review.accepted` fails until the
+combined outcome is `complete`.
+
+The root-cause gate covers the original failure, first faulty production layer,
+shared fix, red-before/green-after regression and direct consumers. When
+recovery is required, its gate covers isolated production-chain rebuilding,
+current identity rebinding, shared validator recomputation, snapshot-first
+zero-write mutation for real data, configured non-target conservation scopes,
+and optional external-call ledger preservation. This evidence travels inside
+the event-backed snapshot and code handoff; no Markdown is needed to recreate
+the decision.
+
 ## Source-session removal
 
 After destination readiness, code handoff acceptance, management handoff

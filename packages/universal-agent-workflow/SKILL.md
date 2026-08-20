@@ -33,6 +33,9 @@ on the desktop, or in a user home directory.
 2. Make a simple plan for a small task and a full contract for a complex task.
    Record objective, non-goals, allowed actions, forbidden actions, risks,
    outputs, and acceptance criteria.
+   For a repair task, attach a code-generated `repair_policy`. It keeps product
+   root-cause closure separate from recovery of already affected state. A
+   repaired record or artifact alone never satisfies final acceptance.
 3. Probe the host inventory. Native mode requires create, send, wait, and read
    capabilities. Missing any required capability selects manual mode and lists
    the exact missing names. The Skill never pretends to have a host tool.
@@ -83,7 +86,7 @@ intake -> planning -> bootstrap_pending -> destination_ready -> dispatched
 ```
 
 Correction returns to execution. A blocked task stays blocked until an
-explicit unblock. A valid receipt includes the Skill name and fixed `0.0.3`
+explicit unblock. A valid receipt includes the Skill name and fixed `0.1.0`
 version, destination role, install/resolve path or provider, passed selftest
 and quick validation, capability mode, stable destination identity when the
 host provides one, peer identity, and `ready=true`. “The prompt was received”
@@ -130,6 +133,21 @@ before completion, destination readiness before dispatch, and controlled
 artifact references. Use the management rendering for concise user-facing
 status and execution rendering for technical handoff evidence.
 
+## Repair completion
+
+Use `repair-policy` to generate a project-neutral repair contract. Execution
+then supplies `--repair-evidence-file` with its final or checkpoint report.
+The code evaluates the original failure, first faulty production layer,
+shared root-cause change, red-green regression, and direct consumers before it
+can mark `productRootCauseClosed=true`.
+
+When existing state also needs recovery, the contract separately configures
+an isolated production-chain candidate, current identity rebinding, shared
+validator recomputation, conservation scopes, optional external-call ledger
+preservation, and snapshot-first zero-write guards for real data. Review may
+inspect an incomplete report, but final acceptance is rejected until both the
+product root cause and every required recovery gate pass.
+
 ## Secret boundary
 
 Pass external text through `redact_text` before placing it in events, reports,
@@ -164,7 +182,7 @@ direct consumer; do not build a second state machine or parser in a consumer.
 
 Read `references/contract-schema.md` for the input shape and
 `references/protocol.md` for the event, receipt, relay, and retention
-protocols. The installed package version is `0.0.3`. Collect every issue found
+protocols. The installed package version is `0.1.0`. Collect every issue found
 while fulfilling one continuous user request into one release batch and bump
 the version only once after that batch is verified. Compatible fixes use a
 patch release; backward-compatible capabilities use a minor release; a major

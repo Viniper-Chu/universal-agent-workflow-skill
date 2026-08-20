@@ -11,6 +11,7 @@ import json
 import re
 import shutil
 import tempfile
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -49,6 +50,13 @@ from retention import (
     rotate_generations,
 )
 from workflow_policy import WorkflowPolicyError, load_policy, validate_policy
+from repair_policy import (
+    RepairPolicyError,
+    build_repair_policy,
+    evaluate_repair_evidence,
+    repair_policy_projection,
+    validate_repair_policy,
+)
 
 
 STATES = {
@@ -136,7 +144,7 @@ EVENT_ACTOR_ROLES: dict[str, set[str]] = {
 ACTORS = {"management", "execution", "reviewer", "host", "system"}
 # Persisted contracts from the immediately previous release remain readable
 # while new contracts and receipts use the single current package version.
-LEGACY_SKILL_VERSIONS = {"0.0.1", "0.0.2"}
+LEGACY_SKILL_VERSIONS = {"0.0.1", "0.0.2", "0.0.3"}
 
 
 class WorkflowError(RuntimeError):
@@ -340,6 +348,9 @@ def _validate_contract(contract: dict[str, Any], *, allow_legacy: bool) -> dict[
         raise WorkflowError("contract role is invalid")
     if contract["complexity"] not in {"simple", "complex"}:
         raise WorkflowError("contract complexity is invalid")
+    contract.setdefault("work_type", "repair" if "repair_policy" in contract else "general")
+    if contract["work_type"] not in {"general", "repair"}:
+        raise WorkflowError("contract work_type is invalid")
     for key in ("acceptance", "allowed_actions", "forbidden_actions"):
         if not isinstance(contract[key], list):
             raise WorkflowError(f"contract {key} must be a list")
@@ -349,6 +360,15 @@ def _validate_contract(contract: dict[str, Any], *, allow_legacy: bool) -> dict[
         policy = contract["migration_policy"]
         if not isinstance(policy, dict) or not isinstance(policy.get("enabled", False), bool):
             raise WorkflowError("migration_policy must be an object with boolean enabled")
+    if "repair_policy" in contract:
+        if contract["work_type"] != "repair":
+            raise WorkflowError("repair_policy requires work_type=repair")
+        try:
+            contract["repair_policy"] = validate_repair_policy(contract["repair_policy"])
+        except RepairPolicyError as exc:
+            raise WorkflowError(str(exc)) from exc
+    elif contract["work_type"] == "repair":
+        raise WorkflowError("repair work_type requires a code-generated repair_policy")
     contract.setdefault("skill_name", SKILL_NAME)
     contract.setdefault("skill_version", SKILL_VERSION)
     allowed_versions = {SKILL_VERSION, *LEGACY_SKILL_VERSIONS} if allow_legacy else {SKILL_VERSION}
@@ -381,6 +401,8 @@ def make_contract(
     plan_steps: Iterable[str] | None = None,
     destination_role: str = "execution",
     migration_policy: dict[str, Any] | None = None,
+    repair_policy: dict[str, Any] | None = None,
+    work_type: str | None = None,
 ) -> dict[str, Any]:
     if plan_steps is None:
         plan_steps = (
@@ -404,9 +426,12 @@ def make_contract(
         "plan_steps": list(plan_steps),
         "destination_role": destination_role,
         "migration_policy": dict(migration_policy or {"enabled": False}),
+        "work_type": work_type or ("repair" if repair_policy is not None else "general"),
         "skill_name": SKILL_NAME,
         "skill_version": SKILL_VERSION,
     }
+    if repair_policy is not None:
+        contract["repair_policy"] = dict(repair_policy)
     return validate_contract(contract)
 
 
@@ -472,6 +497,8 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
         "session_deleted": False,
         "session_removed": False,
         "execution_report_ref": None,
+        "repair_evidence": None,
+        "repair_outcome": None,
         "independent_acceptance": False,
         "checkpoint": False,
         "last_reason": None,
@@ -565,6 +592,10 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
         elif event_name == "execution.reported":
             state["status"] = "reviewing"
             state["execution_report_ref"] = payload.get("report_ref")
+            state["repair_evidence"] = payload.get("repairEvidence")
+            repair_policy = contract.get("repair_policy")
+            if repair_policy is not None and state["repair_evidence"] is not None:
+                state["repair_outcome"] = evaluate_repair_evidence(repair_policy, state["repair_evidence"])
         elif event_name == "review.correction_requested":
             state["status"] = "correction"
             state["last_reason"] = payload.get("reason")
@@ -855,6 +886,14 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
     if event == "execution.reported":
         if status != "executing" or not _nonempty(payload.get("report_ref")):
             raise WorkflowError("execution report requires executing state and report_ref")
+        repair_policy = state.get("contract", {}).get("repair_policy")
+        if repair_policy is not None:
+            if payload.get("repairEvidence") is None:
+                raise WorkflowError("repair execution report requires code-validated repair evidence")
+            try:
+                evaluate_repair_evidence(repair_policy, payload["repairEvidence"])
+            except RepairPolicyError as exc:
+                raise WorkflowError(str(exc)) from exc
         return
     if event == "review.correction_requested":
         if status != "reviewing":
@@ -871,6 +910,11 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
         supervision = state.get("supervision")
         if not isinstance(supervision, dict) or not _dispatch_review_ready(state, supervision.get("dispatchId")):
             raise WorkflowError("review requires same-dispatch wait observed or observed read fallback")
+        repair_policy = state.get("contract", {}).get("repair_policy")
+        if repair_policy is not None:
+            outcome = state.get("repair_outcome")
+            if not isinstance(outcome, dict) or outcome.get("complete") is not True:
+                raise WorkflowError("repair acceptance requires product root-cause closure and required data recovery")
         return
     if event == "completion.requested":
         if status != "accepted" or not state.get("independent_acceptance"):
@@ -1349,7 +1393,14 @@ class WorkflowStore:
     def start_execution(self, task_id: str, actor: str = "execution") -> dict[str, Any]:
         return self._append(task_id, "execution.started", {}, actor)
 
-    def report(self, task_id: str, report_ref: str | None = None, report_text: str | None = None, actor: str = "execution") -> dict[str, Any]:
+    def report(
+        self,
+        task_id: str,
+        report_ref: str | None = None,
+        report_text: str | None = None,
+        repair_evidence: dict[str, Any] | None = None,
+        actor: str = "execution",
+    ) -> dict[str, Any]:
         if report_text and not report_ref:
             report_path = self.root / "reports" / f"{task_id}-execution.md"
             _validate_ref(report_path, self.root)
@@ -1359,7 +1410,10 @@ class WorkflowStore:
         if not report_ref:
             raise WorkflowError("report requires report_ref or report_text")
         _validate_ref(self.root / report_ref, self.root)
-        return self._append(task_id, "execution.reported", {"report_ref": report_ref}, actor)
+        payload: dict[str, Any] = {"report_ref": report_ref}
+        if repair_evidence is not None:
+            payload["repairEvidence"] = redact_json(repair_evidence)
+        return self._append(task_id, "execution.reported", payload, actor)
 
     def review(self, task_id: str, decision: str, actor: str = "management", independent: bool = False, checkpoint: bool = False, reason: str | None = None) -> dict[str, Any]:
         if decision == "accepted":
@@ -1474,6 +1528,8 @@ class WorkflowStore:
             "supervision": state.get("supervision"),
             "legacyCompatibility": state.get("legacy_compatibility", False),
             "coordinationPolicy": coordination_policy_projection(),
+            "repairPolicy": repair_policy_projection(),
+            "repairOutcome": state.get("repair_outcome"),
             "retention": retention_summary(self.root),
         }
 
@@ -1661,16 +1717,24 @@ def render_status(snapshot: dict[str, Any], audience: str = "management") -> str
     retention = snapshot.get("retention", {})
     if audience == "user":
         return f"任务 {task_id} 当前状态：{status}。"
-    return "\n".join(
-        [
-            f"task: {task_id}",
-            f"status: {status}",
-            f"destination_ready: {bool(snapshot.get('destination_ready'))}",
-            f"execution_report: {snapshot.get('execution_report_ref') or 'none'}",
-            f"independent_acceptance: {bool(snapshot.get('independent_acceptance'))}",
-            f"retention: {retention.get('ok', True)}; candidates={len(retention.get('candidates', []))}",
-        ]
-    )
+    lines = [
+        f"task: {task_id}",
+        f"status: {status}",
+        f"destination_ready: {bool(snapshot.get('destination_ready'))}",
+        f"execution_report: {snapshot.get('execution_report_ref') or 'none'}",
+        f"independent_acceptance: {bool(snapshot.get('independent_acceptance'))}",
+    ]
+    repair_outcome = snapshot.get("repair_outcome")
+    if isinstance(repair_outcome, dict):
+        lines.extend(
+            [
+                f"product_root_cause_closed: {bool(repair_outcome.get('productRootCauseClosed'))}",
+                f"data_recovered: {bool(repair_outcome.get('dataRecovered'))}",
+                f"repair_complete: {bool(repair_outcome.get('complete'))}",
+            ]
+        )
+    lines.append(f"retention: {retention.get('ok', True)}; candidates={len(retention.get('candidates', []))}")
+    return "\n".join(lines)
 
 
 def build_handoff_packet(
@@ -1828,6 +1892,50 @@ def run_selftest() -> dict[str, Any]:
     packaged_policy = load_policy(Path(__file__).resolve().parents[1], SKILL_VERSION)
     policy_validation = validate_policy(packaged_policy, SKILL_VERSION)
     checks["runtime_policy"] = policy_validation["ok"] and policy_validation["externalMarkdownRequired"] is False
+    repair_contract = build_repair_policy(
+        data_recovery_required=True,
+        real_data_write=True,
+        identity_keys=["sourceIdentity", "currentTupleId", "attemptVersion"],
+        validation_checks=["quality", "source", "projection"],
+        conservation_scopes=["target", "same-container-non-target", "other-containers"],
+        preserve_external_call_ledger=True,
+    )
+    repair_evidence = {
+        "schemaVersion": 1,
+        "rootCause": {
+            "originalFailureReproduced": False,
+            "firstFaultLayer": "",
+            "sharedRootCauseFixed": False,
+            "regression": {"redBeforeFix": False, "greenAfterFix": False},
+            "directConsumersPassed": False,
+        },
+        "dataRecovery": {
+            "status": "recovered",
+            "isolatedProductionRebuild": True,
+            "identityRebound": True,
+            "identityKeys": ["sourceIdentity", "currentTupleId", "attemptVersion"],
+            "sharedValidatorsRecomputed": True,
+            "sharedValidationChecks": ["quality", "source", "projection"],
+            "snapshotSucceeded": True,
+            "guardFailuresZeroWrite": True,
+            "conservation": {
+                "passed": True,
+                "scopes": ["target", "same-container-non-target", "other-containers"],
+                "externalCallLedgerPreserved": True,
+            },
+        },
+    }
+    recovered_only = evaluate_repair_evidence(repair_contract, repair_evidence)
+    checks["repair_data_not_completion"] = recovered_only["outcome"] == "data_recovered_product_root_cause_open" and recovered_only["complete"] is False
+    closed_evidence = deepcopy(repair_evidence)
+    closed_evidence["rootCause"] = {
+        "originalFailureReproduced": True,
+        "firstFaultLayer": "shared producer",
+        "sharedRootCauseFixed": True,
+        "regression": {"redBeforeFix": True, "greenAfterFix": True},
+        "directConsumersPassed": True,
+    }
+    checks["repair_root_and_recovery_complete"] = evaluate_repair_evidence(repair_contract, closed_evidence)["complete"] is True
     migration = build_migration_sequence(
         "old-management",
         "new-management",
