@@ -29,7 +29,7 @@ class DeploymentV003Tests(unittest.TestCase):
     def test_version_sources_are_consistent(self):
         with (ROOT / "pyproject.toml").open("rb") as handle:
             project_version = tomllib.load(handle)["project"]["version"]
-        self.assertEqual(SKILL_VERSION, "0.1.0")
+        self.assertEqual(SKILL_VERSION, "0.2.0")
         self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), SKILL_VERSION)
         self.assertEqual((PACKAGE / "VERSION").read_text(encoding="utf-8").strip(), SKILL_VERSION)
         self.assertEqual(project_version, SKILL_VERSION)

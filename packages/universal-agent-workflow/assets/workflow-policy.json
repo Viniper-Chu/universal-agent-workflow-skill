@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "policyName": "universal-agent-workflow-runtime-policy",
-  "policyVersion": "0.1.0",
+  "policyVersion": "0.2.0",
   "runtimeAuthority": "code-state",
   "externalMarkdownRequired": false,
   "rules": [
@@ -82,6 +82,48 @@
       "appliesTo": ["management"],
       "enforcement": "state-machine",
       "text": "Management waits for execution, checks intermediate state, corrects direction and independently accepts the final outcome."
+    },
+    {
+      "id": "delivery-acknowledgement",
+      "appliesTo": ["management", "execution"],
+      "enforcement": "state-machine",
+      "text": "Execution starts only after one event atomically binds the dispatch, message and destination identities to an acknowledged host delivery."
+    },
+    {
+      "id": "supervision-epochs",
+      "appliesTo": ["management", "execution"],
+      "enforcement": "state-machine",
+      "text": "Every wait, observation and correction is bound to a monotonic supervision epoch; a prior epoch cannot satisfy a later review gate."
+    },
+    {
+      "id": "same-task-correction",
+      "appliesTo": ["management", "execution"],
+      "enforcement": "state-machine",
+      "text": "A correction continues the same dispatch and execution task with a new correction identity and evidence delta; it does not repeat execution start or create a replacement task."
+    },
+    {
+      "id": "delegation-ownership",
+      "appliesTo": ["management", "execution", "reviewer"],
+      "enforcement": "coordination-policy",
+      "text": "Structured delegation records role, agent identities, ownership scope, access, output, dependencies and aggregator; concurrent execution writers cannot overlap scopes."
+    },
+    {
+      "id": "review-freshness",
+      "appliesTo": ["management", "reviewer"],
+      "enforcement": "state-machine",
+      "text": "Independent acceptance is bound to the current report revision, event cursor, work state and a non-execution reviewer identity."
+    },
+    {
+      "id": "settings-read-only-proof",
+      "appliesTo": ["management"],
+      "enforcement": "coordination-policy",
+      "text": "Host settings evidence is read-only; it can prove inheritance or a user change but never authorizes an automatic model or preference mutation."
+    },
+    {
+      "id": "no-progress-same-execution",
+      "appliesTo": ["management"],
+      "enforcement": "coordination-policy",
+      "text": "Repeated observed progress cursors request the first fault, blocker and narrowed next action from the same execution task; timeouts are not progress evidence."
     },
     {
       "id": "checkpoint-not-final",

@@ -13,6 +13,20 @@ class BootstrapError(ValueError):
     """Raised when a destination cannot prove the exact Skill is ready."""
 
 
+def extract_readiness_receipt(value: Any) -> dict[str, Any]:
+    """Accept either the receipt itself or destination-bootstrap's JSON output."""
+    if not isinstance(value, dict):
+        raise BootstrapError("readiness receipt must be an object")
+    if value.get("command") == "destination-bootstrap":
+        if value.get("ok") is not True or value.get("externalReadsRequired") is not False:
+            raise BootstrapError("destination-bootstrap output is not an accepted code receipt")
+        receipt = value.get("receipt")
+        if not isinstance(receipt, dict):
+            raise BootstrapError("destination-bootstrap output has no receipt object")
+        return dict(receipt)
+    return dict(value)
+
+
 def make_bootstrap_packet(
     role: str,
     destination_id: str,
@@ -59,8 +73,7 @@ def validate_readiness_receipt(
     expected_role: str | None = None,
     expected_destination_id: str | None = None,
 ) -> dict[str, Any]:
-    if not isinstance(receipt, dict):
-        raise BootstrapError("readiness receipt must be an object")
+    receipt = extract_readiness_receipt(receipt)
     if receipt.get("skillName") != SKILL_NAME or receipt.get("skillVersion") != SKILL_VERSION:
         raise BootstrapError("readiness receipt Skill name or version mismatch")
     if receipt.get("runtimeAuthority") != "code-state" or receipt.get("externalReadsRequired") is not False:
@@ -212,6 +225,6 @@ def make_verified_readiness_receipt(
 
 
 __all__ = [
-    "BootstrapError", "SKILL_NAME", "SKILL_VERSION", "installation_plan", "make_bootstrap_packet",
+    "BootstrapError", "SKILL_NAME", "SKILL_VERSION", "extract_readiness_receipt", "installation_plan", "make_bootstrap_packet",
     "make_readiness_receipt", "make_verified_readiness_receipt", "validate_readiness_receipt",
 ]

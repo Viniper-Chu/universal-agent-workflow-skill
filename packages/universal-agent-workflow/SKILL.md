@@ -1,6 +1,6 @@
 ---
 name: universal-agent-workflow
-description: Use this skill when a project needs a contract-first management/execution workflow with explicit planning, role routing, capability-aware native or manual handoff, readiness-verified destination bootstrap, auditable state transitions, secret redaction, and safe retention of Skill-owned artifacts.
+description: Use this skill when a project needs a contract-first management/execution workflow with explicit planning, role routing, capability-aware native or manual handoff, readiness-verified destination bootstrap, epoch-bound live supervision, ownership-safe delegation, fresh independent review, secret redaction, and safe retention of Skill-owned artifacts.
 ---
 
 # Universal Agent Workflow
@@ -62,16 +62,32 @@ on the desktop, or in a user home directory.
    return `MANUAL_SESSION_REMOVAL_REQUIRED` with a precise manual instruction.
    A failed removal never writes a removed terminal state.
 8. Dispatch through the canonical host-action sequence: management plans a
-   `prompt` send followed by `wait_threads`; record the send result before
-   execution starts. Review/correction requires same-dispatch wait observation,
-   or an observed read-only `read_thread` fallback after a failed wait. Then
-   report, review, correct when needed, and obtain independent acceptance. A
-   checkpoint is not acceptance and a report alone cannot complete a task.
-9. After management-confirmed handoff or independently accepted completion,
+   `prompt` send followed by `wait_threads`. Execution starts only after one
+   acknowledged delivery binds the dispatch, message, and destination
+   identities. Bind every later wait, read, report, and correction to a
+   monotonic supervision epoch. Review/correction requires current-epoch wait
+   observation, or an observed read-only `read_thread` fallback after a failed
+   wait. A correction continues the same dispatch and execution task with a
+   new correction identity and evidence delta; it does not repeat execution
+   start or create a replacement task.
+9. Bind independent acceptance to the current report revision, event cursor,
+   reviewing state, and a reviewer identity distinct from execution. Treat
+   checkpoints and stale reports as non-final. If progress cursors remain
+   unchanged across observed epochs, request a blocker diagnosis and narrowed
+   next action from the same execution task; a timeout alone is not evidence
+   of no progress.
+10. When delegation has real parallel value, record parent and child agent
+    identities, role, ownership scopes, access mode, output, dependencies, and
+    aggregator. Management delegates management artifacts only; execution
+    delegates implementation branches only; reviewer delegates read-only
+    review. Concurrent execution writers must not overlap ownership scopes.
+    Host settings evidence is read-only and never authorizes automatic changes
+    to a user's model or preference choices.
+11. After management-confirmed handoff or independently accepted completion,
    let `next-action` drive retention dry-run, apply, and stop. Keep current,
    previous, and retained evidence; remove only registered older or ephemeral
    Skill artifacts. There is no background cleanup.
-10. Before retiring legacy workflow source documents, run `source-migrate`.
+12. Before retiring legacy workflow source documents, run `source-migrate`.
     It preserves every non-blank line as redacted structured local evidence,
     validates the packaged runtime policy, and marks the capsule non-runtime.
     Delete or archive the originals only after release and install acceptance.
@@ -85,8 +101,9 @@ intake -> planning -> bootstrap_pending -> destination_ready -> dispatched
 -> executing -> reviewing -> accepted -> complete
 ```
 
-Correction returns to execution. A blocked task stays blocked until an
-explicit unblock. A valid receipt includes the Skill name and fixed `0.1.0`
+Correction remains in the same execution task and opens a new supervision
+epoch. A blocked task stays blocked until an explicit unblock. A valid receipt
+includes the Skill name and fixed `0.2.0`
 version, destination role, install/resolve path or provider, passed selftest
 and quick validation, capability mode, stable destination identity when the
 host provides one, peer identity, and `ready=true`. “The prompt was received”
@@ -128,10 +145,12 @@ claims that a session was created or a message was sent.
 ## Audit and rendering
 
 Use `status`, `next-action`, and `audit` for projections. Audit checks the
-contract-created first event, report-before-review, independent acceptance
-before completion, destination readiness before dispatch, and controlled
-artifact references. Use the management rendering for concise user-facing
-status and execution rendering for technical handoff evidence.
+contract-created first event, destination readiness before dispatch,
+acknowledged delivery before execution, current-epoch supervision,
+report-before-review, current-revision independent acceptance before
+completion, delegation ownership, and controlled artifact references. Use the
+management rendering for concise user-facing status and execution rendering
+for technical handoff evidence.
 
 ## Repair completion
 
@@ -175,14 +194,17 @@ user to confirm the receipt and acceptance before running cleanup.
 ## Minimal verification
 
 The built-in selftest covers native/manual probing, migration confirmation,
-bootstrap receipt gates, role routing, lifecycle ordering, checkpoint rejection,
-redaction, retention dry-run/apply, protected current/previous artifacts, and
-idempotent cleanup. Extend tests only when the project contract exposes a new
-direct consumer; do not build a second state machine or parser in a consumer.
+bootstrap receipt gates, direct receipt piping, role routing, acknowledged
+delivery, supervision epochs, same-task correction, fresh independent review,
+delegation ownership, read-only settings evidence, no-progress escalation,
+checkpoint rejection, redaction, retention dry-run/apply, protected
+current/previous artifacts, and idempotent cleanup. Extend tests only when the
+project contract exposes a new direct consumer; do not build a second state
+machine or parser in a consumer.
 
 Read `references/contract-schema.md` for the input shape and
 `references/protocol.md` for the event, receipt, relay, and retention
-protocols. The installed package version is `0.1.0`. Collect every issue found
+protocols. The installed package version is `0.2.0`. Collect every issue found
 while fulfilling one continuous user request into one release batch and bump
 the version only once after that batch is verified. Compatible fixes use a
 patch release; backward-compatible capabilities use a minor release; a major

@@ -54,7 +54,12 @@ class WorkflowEngineTests(unittest.TestCase):
         dispatch_id = state["supervision"]["dispatchId"]
         send = next(item for item in state["host_actions"] if item.get("dispatchId") == dispatch_id and item["action"] == "send_message")
         wait = next(item for item in state["host_actions"] if item.get("dispatchId") == dispatch_id and item["action"] == "wait_threads")
-        store.record_host_action_result("task", send["actionId"], "sent", {"ok": True, "messageId": "test-send"})
+        store.record_host_action_result("task", send["actionId"], "sent", {
+            "ok": True,
+            "deliveryAcknowledged": True,
+            "messageId": send["messageId"],
+            "threadId": send["args"]["threadId"],
+        })
         if wait_result is None:
             store.record_host_action_result("task", wait["actionId"], "observed", {"ok": True, "observed": True})
         else:
@@ -100,7 +105,7 @@ class WorkflowEngineTests(unittest.TestCase):
         store.create_contract(contract)
         store.plan("management-handoff", contract["plan_steps"])
         store.bootstrap("management-handoff", "management", "management-7", "source-management", "installed", "native")
-        receipt = self.receipt("management-7")
+        receipt = self.receipt("management-7", "source-management")
         receipt["role"] = "management"
         with self.assertRaisesRegex(WorkflowError, "does not match destination role"):
             store.destination_ready("management-handoff", receipt, "management", "management-7", actor="execution")
@@ -114,7 +119,7 @@ class WorkflowEngineTests(unittest.TestCase):
         store.create_contract(contract)
         store.plan("execution-handoff", contract["plan_steps"])
         store.bootstrap("execution-handoff", "execution", "execution-7", "management-7", "installed", "native")
-        receipt = self.receipt("execution-7")
+        receipt = self.receipt("execution-7", "management-7")
         store.destination_ready("execution-handoff", receipt, "execution", "execution-7")
         exported = store.export_code_handoff(
             "execution-handoff",
@@ -135,7 +140,7 @@ class WorkflowEngineTests(unittest.TestCase):
         snapshot = store.handoff_accept("execution-handoff", "execution", "source-session")
         self.assertTrue(snapshot["handoff_accepted"])
 
-    def receipt(self, destination="destination"):
+    def receipt(self, destination="destination", peer="management-peer"):
         return {
             "skillName": SKILL_NAME,
             "skillVersion": SKILL_VERSION,
@@ -146,7 +151,7 @@ class WorkflowEngineTests(unittest.TestCase):
             "capabilityMode": "native",
             "destinationId": destination,
             "stableSessionId": "stable-session",
-            "peerIdentity": "execution-peer",
+            "peerIdentity": peer,
             "runtimeAuthority": "code-state",
             "externalReadsRequired": False,
             "validationSource": "destination-bootstrap",
@@ -746,7 +751,12 @@ class WorkflowEngineTests(unittest.TestCase):
             with self.assertRaises(WorkflowError):
                 store.record_host_action_result("task", send["actionId"], "sent", {"ok": True}, actor="host")
             self.assertEqual(len(store.events("task")), before)
-            store.record_host_action_result("task", send["actionId"], "sent", {"ok": True})
+            store.record_host_action_result("task", send["actionId"], "sent", {
+                "ok": True,
+                "deliveryAcknowledged": True,
+                "messageId": send["messageId"],
+                "threadId": send["args"]["threadId"],
+            })
             self.assertEqual(next_action(store.snapshot("task"))["action"], "start_execution")
             store.start_execution("task")
             self.assertEqual(next_action(store.snapshot("task"))["action"], "wait_dispatch_host_action")
@@ -758,7 +768,8 @@ class WorkflowEngineTests(unittest.TestCase):
             store.record_host_action_result("task", wait["actionId"], "observed", {"timedOut": False, "wake": {"reason": "turnCompleted"}})
             store.report("task", report_ref="reports/task.md")
             store.review("task", "correction", reason="wait now observed")
-            self.assertEqual(store.state("task")["status"], "correction")
+            self.assertEqual(store.state("task")["status"], "executing")
+            self.assertEqual(store.state("task")["supervision"]["supervisionEpoch"], 2)
 
             temp2, project2, store2 = self.make_store()
             try:
@@ -769,7 +780,12 @@ class WorkflowEngineTests(unittest.TestCase):
                 state2 = store2.state("task")
                 send2 = next(item for item in state2["host_actions"] if item["action"] == "send_message")
                 wait2 = next(item for item in state2["host_actions"] if item["action"] == "wait_threads")
-                store2.record_host_action_result("task", send2["actionId"], "sent", {"ok": True})
+                store2.record_host_action_result("task", send2["actionId"], "sent", {
+                    "ok": True,
+                    "deliveryAcknowledged": True,
+                    "messageId": send2["messageId"],
+                    "threadId": send2["args"]["threadId"],
+                })
                 store2.start_execution("task")
                 store2.record_host_action_result("task", wait2["actionId"], "failed", {"ok": False, "error": "wait unavailable"})
                 read = next(item for item in store2.state("task")["host_actions"] if item["action"] == "read_thread")
@@ -778,7 +794,8 @@ class WorkflowEngineTests(unittest.TestCase):
                 store2.record_host_action_result("task", read["actionId"], "observed", {"ok": True, "snapshot": "state"})
                 store2.report("task", report_ref="reports/task.md")
                 store2.review("task", "correction", reason="read observed")
-                self.assertEqual(store2.state("task")["status"], "correction")
+                self.assertEqual(store2.state("task")["status"], "executing")
+                self.assertEqual(store2.state("task")["supervision"]["supervisionEpoch"], 2)
             finally:
                 temp2.cleanup()
         finally:

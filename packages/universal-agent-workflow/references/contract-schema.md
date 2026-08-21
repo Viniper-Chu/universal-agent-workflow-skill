@@ -17,7 +17,7 @@ The engine accepts a JSON object with these required fields:
   "destination_role": "execution",
   "migration_policy": {"enabled": false},
   "skill_name": "universal-agent-workflow",
-  "skill_version": "0.1.0"
+  "skill_version": "0.2.0"
 }
 ```
 
@@ -78,6 +78,22 @@ For a repair contract, acceptance additionally requires both
 `productRootCauseClosed=true` and all configured recovery gates. A recovered
 record with an open product root cause is projected as
 `data_recovered_product_root_cause_open`.
+
+Current-version dispatch also requires a delivery acknowledgement that binds
+the dispatch ID, generated message ID, and destination thread ID before
+execution starts. Supervision is a sequence of monotonic epochs; observations,
+corrections, and review readiness must bind the current epoch. Each execution
+report carries an increasing revision and its event cursor. A correction binds
+that report, adds a correction ID and evidence delta, and continues the same
+dispatch and execution task. Independent acceptance binds the current report
+revision and cursor and requires a reviewer identity distinct from execution.
+
+Structured delegation records parent/child agent identities, role, ownership
+scopes, access mode, expected output, dependencies, and aggregator. Active
+execution delegations with write access cannot overlap ownership scopes.
+Management delegation is limited to management artifacts; reviewer delegation
+is read-only. Settings inheritance evidence is observational and must declare
+`readOnly=true`; it cannot authorize a model or preference mutation.
 
 When `migration_policy.enabled` is true, source-session removal still requires
 an explicit management event recording user-confirmed migration, the
