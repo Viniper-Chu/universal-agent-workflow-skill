@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Code-backed coordination contracts for the 0.1.0 release batch.
+"""Code-backed coordination contracts for the 0.2.0 release batch.
 
 The module owns the native host-action argument schemas, migration identity
 chain, settings policy, supervision fallback, and role delegation rules.
@@ -33,6 +33,7 @@ ACTION_TO_TOOL = {
     "create_thread": "codex_app__create_thread",
 }
 DEFAULT_WAIT_TIMEOUT_MS = 120000
+DEFAULT_NO_PROGRESS_LIMIT = 3
 HOST_ARG_SCHEMAS = {
     "send_message": {
         "required": frozenset({"threadId", "prompt"}),
@@ -77,6 +78,12 @@ SETTINGS_POLICY = {
     "inherit_management": True,
     "preserve_user_settings": True,
     "omit_overrides": sorted(FORBIDDEN_OVERRIDE_KEYS),
+}
+
+DELEGATION_ACCESS_POLICY = {
+    "management": frozenset({"read", "management_artifact"}),
+    "execution": frozenset({"read", "implementation"}),
+    "reviewer": frozenset({"read"}),
 }
 
 _MIGRATION_STEP_CONTRACT = {
@@ -236,6 +243,9 @@ def build_host_action(
     dispatch_id: str | None = None,
     actor_session_id: str | None = None,
     chain_id: str | None = None,
+    supervision_epoch: int | None = None,
+    message_id: str | None = None,
+    correction_id: str | None = None,
 ) -> dict[str, Any]:
     """Build a planned host action without claiming host execution."""
     if action not in ACTION_TO_TOOL:
@@ -249,6 +259,18 @@ def build_host_action(
     } and actor_role != "management":
         raise CoordinationPolicyError("management migration create/send actions must be planned by management")
     normalized_args = sanitize_host_args(action, args or {})
+    if supervision_epoch is not None and (
+        not isinstance(supervision_epoch, int)
+        or isinstance(supervision_epoch, bool)
+        or supervision_epoch < 1
+    ):
+        raise CoordinationPolicyError("supervisionEpoch must be a positive integer")
+    if message_id is not None and not _nonempty(message_id):
+        raise CoordinationPolicyError("messageId must be non-empty")
+    if correction_id is not None and not _nonempty(correction_id):
+        raise CoordinationPolicyError("correctionId must be non-empty")
+    if action == "send_message" and dispatch_id is not None and message_id is None:
+        message_id = f"{dispatch_id}:message:{supervision_epoch or 1}"
     result = {
         "schemaVersion": 1,
         "actionId": action_id or f"{phase}:{action}:{tool}",
@@ -266,6 +288,9 @@ def build_host_action(
         ("dispatchId", dispatch_id),
         ("actorSessionId", actor_session_id),
         ("chainId", chain_id),
+        ("supervisionEpoch", supervision_epoch),
+        ("messageId", message_id),
+        ("correctionId", correction_id),
     ):
         if value is not None:
             result[key] = value
@@ -289,6 +314,16 @@ def validate_host_action(action: Any) -> dict[str, Any]:
         raise CoordinationPolicyError("management migration create/send actions must be planned by management")
     if action.get("actorSessionId") is not None and not _nonempty(action.get("actorSessionId")):
         raise CoordinationPolicyError("actorSessionId must be non-empty")
+    epoch = action.get("supervisionEpoch")
+    if epoch is not None and (
+        not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 1
+    ):
+        raise CoordinationPolicyError("supervisionEpoch must be a positive integer")
+    for key in ("messageId", "correctionId"):
+        if action.get(key) is not None and not _nonempty(action.get(key)):
+            raise CoordinationPolicyError(f"{key} must be non-empty")
+    if action.get("action") == "send_message" and action.get("dispatchId") and not _nonempty(action.get("messageId")):
+        raise CoordinationPolicyError("dispatch send action requires messageId")
     normalized = deepcopy(action)
     normalized["args"] = sanitize_host_args(normalized["action"], normalized["args"])
     return normalized
@@ -319,6 +354,7 @@ def record_host_action(
     result: Any = None,
     *,
     allow_legacy_wait_shape: bool = False,
+    allow_legacy_delivery_shape: bool = False,
 ) -> dict[str, Any]:
     """Record a host result while keeping planned/sent/observed/failed explicit."""
     current = validate_host_action(action)
@@ -330,6 +366,14 @@ def record_host_action(
     if status in {"sent", "observed"} and not isinstance(result, dict):
         raise CoordinationPolicyError(f"host action {status} requires an object host result")
     _validate_chain_result(current, status, result)
+    if current.get("action") == "send_message" and current.get("dispatchId") and status in {"sent", "observed"}:
+        if not allow_legacy_delivery_shape:
+            if result.get("deliveryAcknowledged") is not True:
+                raise CoordinationPolicyError("dispatch send result requires deliveryAcknowledged=true")
+            if result.get("messageId") != current.get("messageId"):
+                raise CoordinationPolicyError("delivery acknowledgement messageId does not match action")
+            if result.get("threadId") != current.get("args", {}).get("threadId"):
+                raise CoordinationPolicyError("delivery acknowledgement threadId does not match target")
     if current.get("action") == "wait_threads" and status in {"failed", "observed"}:
         wait_result = classify_wait_result(result, allow_legacy_shape=allow_legacy_wait_shape)
         if status == "observed" and wait_result["kind"] != "observed":
@@ -362,9 +406,29 @@ def derive_execution_settings(
         return merged
 
     source = "user" if user_settings is not None else "management"
-    evidence_proven = isinstance(inheritance_evidence, dict) and inheritance_evidence.get("proven") is True
+    effective_settings = merge(management_settings, user_settings or {})
+    evidence_proven = False
+    evidence_status = "UNPROVEN"
+    normalized_evidence: dict[str, Any] | None = None
+    if inheritance_evidence is not None:
+        if not isinstance(inheritance_evidence, dict):
+            raise CoordinationPolicyError("inheritance evidence must be an object")
+        normalized_evidence = deepcopy(inheritance_evidence)
+        if inheritance_evidence.get("proven") is True:
+            if inheritance_evidence.get("readOnly") is not True:
+                raise CoordinationPolicyError("settings inheritance evidence must be read-only")
+            if any(not _nonempty(inheritance_evidence.get(key)) for key in ("source", "destinationId")):
+                raise CoordinationPolicyError("settings inheritance evidence identity is incomplete")
+            if not isinstance(inheritance_evidence.get("observedSettings"), dict):
+                raise CoordinationPolicyError("settings inheritance evidence requires observedSettings")
+            evidence_proven = True
+            evidence_status = (
+                "PROVEN_MATCH"
+                if inheritance_evidence["observedSettings"] == effective_settings
+                else "PROVEN_USER_STATE_DIFFERS"
+            )
     return {
-        "settings": merge(management_settings, user_settings or {}),
+        "settings": effective_settings,
         "managementSnapshot": deepcopy(management_settings),
         "userOverrides": deepcopy(user_settings or {}),
         "source": source,
@@ -372,6 +436,9 @@ def derive_execution_settings(
         "preserveUserSettings": True,
         "evidenceRequired": not evidence_proven,
         "evidenceProven": evidence_proven,
+        "evidenceStatus": evidence_status,
+        "inheritanceEvidence": normalized_evidence,
+        "mutationAllowed": False,
     }
 
 
@@ -403,7 +470,7 @@ def build_execution_creation_action(
     )
     action["settingsPolicy"] = deepcopy(SETTINGS_POLICY)
     action["settingsPolicy"]["evidenceRequired"] = settings["evidenceRequired"]
-    action["settingsPolicy"]["evidenceStatus"] = "proven" if settings["evidenceProven"] else "UNPROVEN"
+    action["settingsPolicy"]["evidenceStatus"] = settings["evidenceStatus"]
     action["settings"] = settings
     action["requiresObservedThreadId"] = True
     return action
@@ -725,19 +792,48 @@ def classify_wait_result(result: Any, *, allow_legacy_shape: bool = False) -> di
     raise CoordinationPolicyError("wait_threads result must be timedOut or an explicit tool status")
 
 
-def build_supervision_plan(dispatch_id: str, wait_result: dict[str, Any] | None = None, read_result: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_supervision_plan(
+    dispatch_id: str,
+    wait_result: dict[str, Any] | None = None,
+    read_result: dict[str, Any] | None = None,
+    *,
+    supervision_epoch: int = 1,
+    correction_id: str | None = None,
+    progress_cursor: str | None = None,
+    previous_progress_cursor: str | None = None,
+    stagnant_epochs: int = 0,
+    no_progress_limit: int = DEFAULT_NO_PROGRESS_LIMIT,
+) -> dict[str, Any]:
     if not _nonempty(dispatch_id):
         raise CoordinationPolicyError("dispatch identity is required")
+    if not isinstance(supervision_epoch, int) or isinstance(supervision_epoch, bool) or supervision_epoch < 1:
+        raise CoordinationPolicyError("supervisionEpoch must be a positive integer")
+    if not isinstance(stagnant_epochs, int) or isinstance(stagnant_epochs, bool) or stagnant_epochs < 0:
+        raise CoordinationPolicyError("stagnantEpochs must be a non-negative integer")
+    if not isinstance(no_progress_limit, int) or isinstance(no_progress_limit, bool) or no_progress_limit < 1:
+        raise CoordinationPolicyError("noProgressLimit must be a positive integer")
+    if correction_id is not None and not _nonempty(correction_id):
+        raise CoordinationPolicyError("correctionId must be non-empty")
+    if progress_cursor is not None and not _nonempty(progress_cursor):
+        raise CoordinationPolicyError("progressCursor must be non-empty")
     plan = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "dispatchId": dispatch_id,
+        "supervisionEpoch": supervision_epoch,
         "sequence": ["wait", "observe", "correct"],
         "nextAction": "wait",
         "failureClass": None,
         "fallbackUsed": False,
         "reviewReady": False,
         "writeAllowed": False,
+        "progressCursor": progress_cursor,
+        "previousProgressCursor": previous_progress_cursor,
+        "stagnantEpochs": stagnant_epochs,
+        "noProgressLimit": no_progress_limit,
+        "replacementSessionAllowed": False,
     }
+    if correction_id is not None:
+        plan["correctionId"] = correction_id
     if wait_result is None:
         return plan
     try:
@@ -756,6 +852,18 @@ def build_supervision_plan(dispatch_id: str, wait_result: dict[str, Any] | None 
         plan["nextAction"] = "observe"
         plan["reviewReady"] = True
         plan["waitResult"] = deepcopy(wait_result)
+        if progress_cursor is not None:
+            if progress_cursor == previous_progress_cursor:
+                plan["stagnantEpochs"] = stagnant_epochs + 1
+            else:
+                plan["stagnantEpochs"] = 0
+            if plan["stagnantEpochs"] >= no_progress_limit:
+                plan["nextAction"] = "request_progress_diagnosis"
+                plan["escalation"] = {
+                    "target": "same_execution",
+                    "request": "first_fault_or_blocker_and_narrow_next_action",
+                    "createReplacementSession": False,
+                }
         return plan
     plan["failureClass"] = "orchestration_harness_failure"
     plan["fallbackUsed"] = True
@@ -799,6 +907,88 @@ def validate_delegation(parent_role: str, work_category: str, child_role: str | 
     }
 
 
+def build_delegation_contract(
+    parent_role: str,
+    work_category: str,
+    child_role: str,
+    *,
+    parent_agent_id: str,
+    child_agent_id: str,
+    ownership_scopes: Iterable[str],
+    access_mode: str,
+    expected_output: str,
+    dependencies: Iterable[str] | None,
+    aggregator_id: str,
+    delegation_id: str | None = None,
+) -> dict[str, Any]:
+    decision = validate_delegation(parent_role, work_category, child_role)
+    if not decision["allowed"]:
+        raise CoordinationPolicyError(decision["reason"])
+    for label, value in (
+        ("parentAgentId", parent_agent_id),
+        ("childAgentId", child_agent_id),
+        ("expectedOutput", expected_output),
+        ("aggregatorId", aggregator_id),
+    ):
+        if not _nonempty(value):
+            raise CoordinationPolicyError(f"delegation {label} is required")
+    if parent_agent_id == child_agent_id:
+        raise CoordinationPolicyError("delegation parent and child identities must differ")
+    scopes = sorted({str(scope).strip() for scope in ownership_scopes if _nonempty(scope)})
+    if not scopes:
+        raise CoordinationPolicyError("delegation requires at least one ownership scope")
+    if access_mode not in DELEGATION_ACCESS_POLICY.get(parent_role, frozenset()):
+        raise CoordinationPolicyError(f"{parent_role} cannot delegate {access_mode} access")
+    if parent_role == "management" and access_mode == "implementation":
+        raise CoordinationPolicyError("management delegation cannot grant implementation access")
+    if parent_role == "execution" and work_category != "parallel_implementation":
+        raise CoordinationPolicyError("execution delegation is limited to parallel implementation")
+    normalized_dependencies = sorted({str(item).strip() for item in (dependencies or []) if _nonempty(item)})
+    return {
+        **decision,
+        "schemaVersion": 2,
+        "delegationId": delegation_id or f"{parent_agent_id}:{child_agent_id}:{work_category}",
+        "parentAgentId": parent_agent_id,
+        "childAgentId": child_agent_id,
+        "ownershipScopes": scopes,
+        "accessMode": access_mode,
+        "expectedOutput": expected_output,
+        "dependencies": normalized_dependencies,
+        "aggregatorId": aggregator_id,
+        "status": "active",
+    }
+
+
+def _scope_overlaps(left: str, right: str) -> bool:
+    left = left.strip().replace("\\", "/").rstrip("/").casefold()
+    right = right.strip().replace("\\", "/").rstrip("/").casefold()
+    if left == right:
+        return True
+    separators = ("/", ":", ".")
+    return any(right.startswith(left + separator) or left.startswith(right + separator) for separator in separators)
+
+
+def validate_delegation_conflicts(candidate: dict[str, Any], active: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    if candidate.get("accessMode") != "implementation":
+        return {"ok": True, "conflicts": []}
+    conflicts: list[str] = []
+    for existing in active:
+        if existing.get("status") != "active" or existing.get("accessMode") != "implementation":
+            continue
+        if existing.get("delegationId") == candidate.get("delegationId"):
+            conflicts.append(str(existing.get("delegationId")))
+            continue
+        if any(
+            _scope_overlaps(left, right)
+            for left in candidate.get("ownershipScopes", [])
+            for right in existing.get("ownershipScopes", [])
+        ):
+            conflicts.append(str(existing.get("delegationId")))
+    if conflicts:
+        raise CoordinationPolicyError("delegation write scope overlaps active delegation: " + ", ".join(sorted(conflicts)))
+    return {"ok": True, "conflicts": []}
+
+
 def coordination_policy_projection() -> dict[str, Any]:
     return {
         "hostActionStatuses": sorted(HOST_ACTION_STATUSES),
@@ -816,7 +1006,12 @@ def coordination_policy_projection() -> dict[str, Any]:
         "delegation": {parent: {category: sorted(children) for category, children in categories.items()} for parent, categories in DELEGATION_POLICY.items()},
         "settingsPolicy": deepcopy(SETTINGS_POLICY),
         "defaultWaitTimeoutMs": DEFAULT_WAIT_TIMEOUT_MS,
+        "defaultNoProgressLimit": DEFAULT_NO_PROGRESS_LIMIT,
         "supervisionSequence": ["wait", "observe", "correct"],
+        "supervisionEpochs": True,
+        "deliveryAcknowledgement": ["dispatchId", "messageId", "threadId"],
+        "delegationAccess": {role: sorted(modes) for role, modes in DELEGATION_ACCESS_POLICY.items()},
+        "reviewFreshness": ["reportRevision", "reportEventCursor", "workState"],
     }
 
 
@@ -824,6 +1019,8 @@ __all__ = [
     "ACTION_TO_TOOL",
     "CoordinationPolicyError",
     "DEFAULT_WAIT_TIMEOUT_MS",
+    "DEFAULT_NO_PROGRESS_LIMIT",
+    "DELEGATION_ACCESS_POLICY",
     "DELEGATION_POLICY",
     "FORBIDDEN_OVERRIDE_KEYS",
     "HOST_ACTION_STATUSES",
@@ -832,6 +1029,7 @@ __all__ = [
     "SETTINGS_POLICY",
     "bind_migration_execution_send",
     "build_execution_creation_action",
+    "build_delegation_contract",
     "build_host_action",
     "build_migration_sequence",
     "build_supervision_plan",
@@ -843,6 +1041,7 @@ __all__ = [
     "summarize_migration_steps",
     "validate_create_target",
     "validate_delegation",
+    "validate_delegation_conflicts",
     "validate_host_action",
     "validate_host_args",
     "validate_migration_sequence",

@@ -119,7 +119,12 @@ class RepairPolicyTests(unittest.TestCase):
             dispatch_id = state["supervision"]["dispatchId"]
             send = next(item for item in state["host_actions"] if item["dispatchId"] == dispatch_id and item["action"] == "send_message")
             wait = next(item for item in state["host_actions"] if item["dispatchId"] == dispatch_id and item["action"] == "wait_threads")
-            store.record_host_action_result("repair-task", send["actionId"], "sent", {"ok": True})
+            store.record_host_action_result("repair-task", send["actionId"], "sent", {
+                "ok": True,
+                "deliveryAcknowledged": True,
+                "messageId": send["messageId"],
+                "threadId": send["args"]["threadId"],
+            })
             store.record_host_action_result("repair-task", wait["actionId"], "observed", {"ok": True})
             store.start_execution("repair-task")
             with self.assertRaisesRegex(WorkflowError, "requires code-validated repair evidence"):
@@ -134,8 +139,24 @@ class RepairPolicyTests(unittest.TestCase):
             self.assertEqual(state["status"], "reviewing")
 
             store.review("repair-task", "correction", reason="close the shared production root cause")
-            store.start_execution("repair-task")
+            correction_state = store.state("repair-task")
+            correction_epoch = correction_state["supervision"]["supervisionEpoch"]
+            correction_send = next(
+                item for item in correction_state["host_actions"]
+                if item.get("supervisionEpoch") == correction_epoch and item["action"] == "send_message"
+            )
+            correction_wait = next(
+                item for item in correction_state["host_actions"]
+                if item.get("supervisionEpoch") == correction_epoch and item["action"] == "wait_threads"
+            )
+            store.record_host_action_result("repair-task", correction_send["actionId"], "sent", {
+                "ok": True,
+                "deliveryAcknowledged": True,
+                "messageId": correction_send["messageId"],
+                "threadId": correction_send["args"]["threadId"],
+            })
             store.report("repair-task", report_ref="reports/repair.md", repair_evidence=self.evidence(root_closed=True))
+            store.record_host_action_result("repair-task", correction_wait["actionId"], "observed", {"ok": True})
             store.review("repair-task", "accepted", independent=True)
             store.complete("repair-task")
             final = store.audit("repair-task")

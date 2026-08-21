@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0
+
+- Added delivery acknowledgements that atomically bind dispatch, message, and
+  destination identities before execution starts.
+- Added monotonic supervision epochs, current-epoch wait/read evidence, and
+  same-task correction with correction identities and evidence deltas.
+- Added report revisions and event-cursor-bound independent acceptance with a
+  reviewer identity distinct from execution.
+- Added structured delegation ownership, role/access boundaries, conflict
+  rejection for overlapping execution writers, and explicit aggregation.
+- Added read-only host-settings proof and same-execution no-progress escalation;
+  timeouts alone do not count as stalled progress.
+- Added direct validation of complete `destination-bootstrap` output and
+  destination identity derivation without hand-editing receipt JSON.
+- Added selftest, CLI, audit, policy, and regression coverage for all new
+  coordination gates while preserving read/replay compatibility for older
+  persisted contracts.
+
 ## 0.1.0
 
 - Added a code-backed repair contract that separates product root-cause

@@ -21,6 +21,11 @@ Native receipts carry a stable session identity. Manual receipts explicitly
 declare when no stable identity exists. Hand-authored receipts without the code
 validation source and policy proof are rejected.
 
+The receipt validator also accepts the complete JSON object emitted by
+`destination-bootstrap`, unwraps its nested readiness receipt, and derives the
+destination actor, role, and peer identity from validated code state. A caller
+does not need to inspect or rewrite that JSON by hand.
+
 ## Code-state handoff
 
 After readiness, management runs `handoff-export`. The resulting
@@ -64,16 +69,44 @@ contract.created -> plan.created -> bootstrap.requested -> destination.ready
 -> handoff.requested -> handoff.bundle_received -> handoff.accepted
 -> dispatch.requested -> coordination.supervision_updated
 -> host-action.planned(send) -> host-action.planned(wait)
--> host-action.sent(send) -> execution.started
+-> host-action.sent(send with delivery acknowledgement) -> execution.started
 -> host-action.observed(wait) -> execution.reported
 -> review.accepted -> completion.requested
 ```
 
-The dispatch send must use the host adapter's `prompt` argument and be recorded
-as sent/observed before execution starts. Review/correction requires the same
-dispatch's observed wait; a failed wait requires an observed read-only
-`read_thread` fallback. Correction and blocked transitions are explicit. A
+The dispatch send must use the host adapter's `prompt` argument. Its host result
+must acknowledge delivery and bind the dispatch, message, and destination
+identities before execution starts. Each wait/read round has a monotonic
+supervision epoch. Review/correction requires the current epoch's observed
+wait; a failed wait requires an observed read-only `read_thread` fallback.
+
+Correction is an explicit same-task branch:
+
+```text
+execution.reported(revision N) -> review.correction_requested(correction ID)
+-> supervision epoch N+1 -> acknowledged correction delivery
+-> current-epoch observation -> execution.reported(revision N+1)
+```
+
+It never repeats `execution.started` or creates a replacement execution task.
+Independent review binds the current report revision, report event cursor,
+reviewing state, and a reviewer identity distinct from execution. Repeated
+observed progress cursors request a blocker diagnosis and narrowed next action
+from the same task; timeouts alone do not count as no-progress evidence. A
 checkpoint cannot complete a task.
+
+## Delegation and settings
+
+Structured delegation binds parent and child agent identities, role,
+ownership scopes, access mode, expected output, dependencies, and aggregator.
+Management delegates management artifacts, execution delegates implementation
+branches, and reviewer delegation is read-only. Concurrent execution writers
+cannot own overlapping scopes. A completion event releases the ownership only
+after the expected output is recorded.
+
+Settings inheritance evidence is read-only. It may prove that destination
+settings match the management source or that the user changed them, but it
+never authorizes automatic model, intelligence, or preference mutation.
 
 ## Repair evidence
 

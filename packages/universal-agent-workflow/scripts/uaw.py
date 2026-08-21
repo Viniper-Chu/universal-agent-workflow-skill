@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-from bootstrap import BootstrapError, SKILL_VERSION, installation_plan, make_verified_readiness_receipt, validate_readiness_receipt
+from bootstrap import BootstrapError, SKILL_VERSION, extract_readiness_receipt, installation_plan, make_verified_readiness_receipt, validate_readiness_receipt
 from deployment import DeploymentError, build_release_asset, deploy_skill
 from retention import verify_git_current
 from workflow_engine import (
@@ -137,7 +137,17 @@ def parser() -> argparse.ArgumentParser:
     supervision_update.add_argument("--dispatch-id", required=True)
     supervision_update.add_argument("--wait-json")
     supervision_update.add_argument("--read-json")
+    supervision_update.add_argument("--supervision-epoch", type=int)
+    supervision_update.add_argument("--correction-id")
+    supervision_update.add_argument("--progress-cursor")
     supervision_update.add_argument("--actor", default="management")
+
+    supervision_advance = sub.add_parser("supervision-advance", help="start the next wait epoch on the same execution task")
+    supervision_advance.add_argument("--project-root", default=".")
+    supervision_advance.add_argument("--output-root", default=".agent-workflow")
+    supervision_advance.add_argument("--task-id", required=True)
+    supervision_advance.add_argument("--dispatch-id", required=True)
+    supervision_advance.add_argument("--actor", default="management")
 
     report = sub.add_parser("report", help="record an execution report")
     report.add_argument("--project-root", default=".")
@@ -146,6 +156,7 @@ def parser() -> argparse.ArgumentParser:
     report.add_argument("--report-ref")
     report.add_argument("--report-text")
     report.add_argument("--repair-evidence-file")
+    report.add_argument("--evidence-delta-file")
     report.add_argument("--actor", default="execution")
 
     review = sub.add_parser("review", help="record independent review or correction")
@@ -156,6 +167,9 @@ def parser() -> argparse.ArgumentParser:
     review.add_argument("--independent", action="store_true")
     review.add_argument("--checkpoint", action="store_true")
     review.add_argument("--reason")
+    review.add_argument("--reviewer-id")
+    review.add_argument("--correction-id")
+    review.add_argument("--evidence-delta-file")
     review.add_argument("--actor", default="management")
 
     transition = sub.add_parser("transition", help="apply one explicit lifecycle event")
@@ -217,7 +231,7 @@ def parser() -> argparse.ArgumentParser:
     receipt.add_argument("--receipt-file", required=True)
     receipt.add_argument("--expected-role")
     receipt.add_argument("--expected-destination-id")
-    receipt.add_argument("--actor", default="execution")
+    receipt.add_argument("--actor")
 
     handoff_export = sub.add_parser("handoff-export", help="export a self-contained code-state handoff bundle")
     handoff_export.add_argument("--project-root", default=".")
@@ -327,6 +341,9 @@ def parser() -> argparse.ArgumentParser:
     host_action.add_argument("--actor-session-id")
     host_action.add_argument("--dispatch-id")
     host_action.add_argument("--chain-id")
+    host_action.add_argument("--supervision-epoch", type=int)
+    host_action.add_argument("--message-id")
+    host_action.add_argument("--correction-id")
     host_action.add_argument("--phase", required=True)
     host_action.add_argument("--action-id")
 
@@ -346,11 +363,17 @@ def parser() -> argparse.ArgumentParser:
     settings_inherit = sub.add_parser("settings-inherit", help="derive execution settings without overriding user choice")
     settings_inherit.add_argument("--management-json", required=True)
     settings_inherit.add_argument("--user-json")
+    settings_inherit.add_argument("--inheritance-evidence-json")
 
     supervision = sub.add_parser("supervision", help="render wait/observe/correct supervision state")
     supervision.add_argument("--dispatch-id", required=True)
     supervision.add_argument("--wait-json")
     supervision.add_argument("--read-json")
+    supervision.add_argument("--supervision-epoch", type=int, default=1)
+    supervision.add_argument("--correction-id")
+    supervision.add_argument("--progress-cursor")
+    supervision.add_argument("--previous-progress-cursor")
+    supervision.add_argument("--stagnant-epochs", type=int, default=0)
 
     delegation = sub.add_parser("delegation-validate", help="validate structured parent-role delegation")
     delegation.add_argument("--parent-role", required=True)
@@ -364,6 +387,15 @@ def parser() -> argparse.ArgumentParser:
     delegation_request.add_argument("--parent-role", required=True)
     delegation_request.add_argument("--work-category", required=True)
     delegation_request.add_argument("--child-role")
+    delegation_request.add_argument("--spec-file")
+
+    delegation_complete = sub.add_parser("delegation-complete", help="release one delegation ownership scope after aggregation")
+    delegation_complete.add_argument("--project-root", default=".")
+    delegation_complete.add_argument("--output-root", default=".agent-workflow")
+    delegation_complete.add_argument("--task-id", required=True)
+    delegation_complete.add_argument("--delegation-id", required=True)
+    delegation_complete.add_argument("--output", required=True)
+    delegation_complete.add_argument("--actor", required=True, choices=["management", "execution", "reviewer"])
 
     source_migrate = sub.add_parser("source-migrate", help="preserve three legacy workflow sources as structured non-runtime evidence")
     source_migrate.add_argument("--project-root", default=".")
@@ -503,6 +535,9 @@ def main(argv: list[str] | None = None) -> int:
                     actor_session_id=args.actor_session_id,
                     dispatch_id=args.dispatch_id,
                     chain_id=args.chain_id,
+                    supervision_epoch=args.supervision_epoch,
+                    message_id=args.message_id,
+                    correction_id=args.correction_id,
                 ),
                 "externalReadsRequired": False,
             })
@@ -536,12 +571,22 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "settings-inherit":
             management_settings = json.loads(args.management_json)
             user_settings = json.loads(args.user_json) if args.user_json else None
-            _json({"ok": True, "command": "settings-inherit", "settings": derive_execution_settings(management_settings, user_settings), "externalReadsRequired": False})
+            inheritance_evidence = json.loads(args.inheritance_evidence_json) if args.inheritance_evidence_json else None
+            _json({"ok": True, "command": "settings-inherit", "settings": derive_execution_settings(management_settings, user_settings, inheritance_evidence=inheritance_evidence), "externalReadsRequired": False})
             return 0
         if args.command == "supervision":
             wait_result = json.loads(args.wait_json) if args.wait_json else None
             read_result = json.loads(args.read_json) if args.read_json else None
-            _json({"ok": True, "command": "supervision", "plan": build_supervision_plan(args.dispatch_id, wait_result, read_result), "externalReadsRequired": False})
+            _json({"ok": True, "command": "supervision", "plan": build_supervision_plan(
+                args.dispatch_id,
+                wait_result,
+                read_result,
+                supervision_epoch=args.supervision_epoch,
+                correction_id=args.correction_id,
+                progress_cursor=args.progress_cursor,
+                previous_progress_cursor=args.previous_progress_cursor,
+                stagnant_epochs=args.stagnant_epochs,
+            ), "externalReadsRequired": False})
             return 0
         if args.command == "delegation-validate":
             _json({"ok": True, "command": "delegation-validate", "decision": validate_delegation(args.parent_role, args.work_category, args.child_role), "externalReadsRequired": False})
@@ -667,20 +712,48 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "supervision-update":
             wait_result = json.loads(args.wait_json) if args.wait_json else None
             read_result = json.loads(args.read_json) if args.read_json else None
-            _json(store.update_supervision(args.task_id, args.dispatch_id, wait_result, read_result, actor=args.actor))
+            _json(store.update_supervision(
+                args.task_id,
+                args.dispatch_id,
+                wait_result,
+                read_result,
+                supervision_epoch=args.supervision_epoch,
+                correction_id=args.correction_id,
+                progress_cursor=args.progress_cursor,
+                actor=args.actor,
+            ))
+            return 0
+        if args.command == "supervision-advance":
+            _json(store.advance_supervision(args.task_id, args.dispatch_id, actor=args.actor))
             return 0
         if args.command == "delegation-request":
-            _json(store.request_delegation(args.task_id, args.parent_role, args.work_category, args.child_role))
+            spec = _read_json_file(args.spec_file) if args.spec_file else None
+            _json(store.request_delegation(args.task_id, args.parent_role, args.work_category, args.child_role, spec))
+            return 0
+        if args.command == "delegation-complete":
+            _json(store.complete_delegation(args.task_id, args.delegation_id, args.output, args.actor))
             return 0
         if args.command == "start":
             _json(store.start_execution(args.task_id, actor=args.actor))
             return 0
         if args.command == "report":
             repair_evidence_value = _read_json_file(args.repair_evidence_file) if args.repair_evidence_file else None
-            _json(store.report(args.task_id, report_ref=args.report_ref, report_text=args.report_text, repair_evidence=repair_evidence_value, actor=args.actor))
+            evidence_delta = _read_json_file(args.evidence_delta_file) if args.evidence_delta_file else None
+            _json(store.report(args.task_id, report_ref=args.report_ref, report_text=args.report_text, repair_evidence=repair_evidence_value, evidence_delta=evidence_delta, actor=args.actor))
             return 0
         if args.command == "review":
-            _json(store.review(args.task_id, args.decision, actor=args.actor, independent=args.independent, checkpoint=args.checkpoint, reason=args.reason))
+            evidence_delta = _read_json_file(args.evidence_delta_file) if args.evidence_delta_file else None
+            _json(store.review(
+                args.task_id,
+                args.decision,
+                actor=args.actor,
+                independent=args.independent,
+                checkpoint=args.checkpoint,
+                reason=args.reason,
+                reviewer_id=args.reviewer_id,
+                correction_id=args.correction_id,
+                evidence_delta=evidence_delta,
+            ))
             return 0
         if args.command == "complete":
             _json(store.complete(args.task_id, actor=args.actor))
@@ -712,7 +785,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "receipt":
             store = _store(args)
-            receipt_value = _read_json_file(args.receipt_file)
+            receipt_value = extract_readiness_receipt(_read_json_file(args.receipt_file))
             validation = validate_readiness_receipt(receipt_value, args.expected_role, args.expected_destination_id)
             snapshot = store.destination_ready(args.task_id, receipt_value, args.expected_role, args.expected_destination_id, args.actor)
             _json({"ok": True, "command": "receipt", "validation": validation, "snapshot": snapshot})

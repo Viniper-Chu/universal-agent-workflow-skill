@@ -186,7 +186,18 @@ class CoordinationPolicyV002Tests(unittest.TestCase):
             PROJECT_TARGET,
             management_settings=management,
             user_settings=user,
-            inheritance_evidence={"proven": True, "source": "host-settings-snapshot"},
+            inheritance_evidence={
+                "proven": True,
+                "readOnly": True,
+                "source": "host-settings-snapshot",
+                "destinationId": "execution-observed",
+                "observedSettings": {
+                    "model": "management-model",
+                    "reasoning": "high",
+                    "locale": "en-US",
+                    "ui": {"theme": "dark", "density": "compact"},
+                },
+            },
         )
         create = sequence[2]
         self.assertEqual(create["settings"]["managementSnapshot"], management)
@@ -201,7 +212,7 @@ class CoordinationPolicyV002Tests(unittest.TestCase):
             },
         )
         self.assertFalse(create["settingsPolicy"]["evidenceRequired"])
-        self.assertEqual(create["settingsPolicy"]["evidenceStatus"], "proven")
+        self.assertEqual(create["settingsPolicy"]["evidenceStatus"], "PROVEN_MATCH")
         self.assertNotIn("model", create["args"])
         self.assertNotIn("thinking", create["args"])
         self.assertNotIn("reasoning", create["args"])

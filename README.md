@@ -18,7 +18,7 @@ python packages/universal-agent-workflow/scripts/uaw.py validate-install \
 python packages/universal-agent-workflow/scripts/uaw.py selftest
 ```
 
-The current release is `0.1.0` and follows Semantic Versioning. Use the same version
+The current release is `0.2.0` and follows Semantic Versioning. Use the same version
 in a destination bootstrap packet and readiness receipt.
 
 One continuous user request is one release batch: collect all issues found
@@ -31,14 +31,14 @@ do not create extra versions.
 ## Release asset install/update
 
 The official asset is
-`https://github.com/Viniper-Chu/universal-agent-workflow-skill/releases/download/v0.1.0/universal-agent-workflow-0.1.0.zip`.
+`https://github.com/Viniper-Chu/universal-agent-workflow-skill/releases/download/v0.2.0/universal-agent-workflow-0.2.0.zip`.
 Download it into a controlled directory, then run the packaged CLI through the
 same code path for a fresh install or an existing target update:
 
 ```text
-curl -L <asset-url> -o universal-agent-workflow-0.1.0.zip
+curl -L <asset-url> -o universal-agent-workflow-0.2.0.zip
 python <uaw-runner>/scripts/uaw.py install \
-  --source universal-agent-workflow-0.1.0.zip \
+  --source universal-agent-workflow-0.2.0.zip \
   --target <skill-dir> --backup-root <controlled-backups>
 python <skill-dir>/scripts/uaw.py validate-install --skill-dir <skill-dir>
 python <skill-dir>/scripts/uaw.py selftest
@@ -118,6 +118,20 @@ create/select destination -> run destination-bootstrap -> validate receipt
 -> export JSON code-state bundle -> run handoff-receive -> validate receipt
 -> dispatch business work
 ```
+
+After dispatch, every host send must return an acknowledgement binding the
+dispatch, generated message, and destination identities. Management then
+supervises with monotonic epochs, so stale wait/read observations cannot unlock
+later correction or review. Corrections continue the same execution task with
+a correction ID and evidence delta; unchanged progress triggers a same-task
+diagnosis rather than silent waiting or automatic replacement.
+
+Independent acceptance is bound to the latest report revision and event cursor
+and must come from a non-execution reviewer identity. Structured delegation
+records role, agent identities, ownership scopes, access mode, dependencies,
+output, and aggregator; concurrent execution writers cannot overlap scopes.
+Settings inheritance checks are read-only and never override a user's model or
+preference choices.
 
 The receipt proves the exact Skill name/version, role, install or resolve
 location, validation results, capability mode, destination identity, peer

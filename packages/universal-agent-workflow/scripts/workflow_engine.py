@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from bootstrap import BootstrapError, SKILL_NAME, SKILL_VERSION, make_bootstrap_packet, validate_readiness_receipt
+from bootstrap import BootstrapError, SKILL_NAME, SKILL_VERSION, extract_readiness_receipt, make_bootstrap_packet, validate_readiness_receipt
 from package_manifest import inspect_skill_package, required_skill_files
 from handoff_bundle import (
     HandoffBundleError,
@@ -28,17 +28,21 @@ from handoff_bundle import (
 from session_migration import build_delete_action, classify_delete_capability, inventory_tools, validate_delete_target
 from coordination_policy import (
     CoordinationPolicyError,
+    DEFAULT_NO_PROGRESS_LIMIT,
     DEFAULT_WAIT_TIMEOUT_MS,
+    build_delegation_contract,
     build_host_action,
     build_migration_sequence,
     build_supervision_plan,
     classify_wait_result,
     coordination_policy_projection,
+    derive_execution_settings,
     MIGRATION_PHASES,
     record_host_action,
     summarize_migration_steps,
     validate_create_target,
     validate_delegation,
+    validate_delegation_conflicts,
     validate_host_action,
     validate_migration_step,
     validate_migration_sequence,
@@ -99,6 +103,7 @@ EVENTS = {
     "coordination.migration_step",
     "coordination.supervision_updated",
     "coordination.delegation_requested",
+    "coordination.delegation_completed",
     "execution.started",
     "execution.reported",
     "review.correction_requested",
@@ -131,10 +136,11 @@ EVENT_ACTOR_ROLES: dict[str, set[str]] = {
     "coordination.migration_step": {"management"},
     "coordination.supervision_updated": {"management"},
     "coordination.delegation_requested": {"management", "execution", "reviewer"},
+    "coordination.delegation_completed": {"management", "execution", "reviewer"},
     "execution.started": {"execution"},
     "execution.reported": {"execution"},
     "review.correction_requested": {"management"},
-    "review.accepted": {"management"},
+    "review.accepted": {"management", "reviewer"},
     "completion.requested": {"management"},
     "blocked": {"management"},
     "unblocked": {"management"},
@@ -144,7 +150,7 @@ EVENT_ACTOR_ROLES: dict[str, set[str]] = {
 ACTORS = {"management", "execution", "reviewer", "host", "system"}
 # Persisted contracts from the immediately previous release remain readable
 # while new contracts and receipts use the single current package version.
-LEGACY_SKILL_VERSIONS = {"0.0.1", "0.0.2", "0.0.3"}
+LEGACY_SKILL_VERSIONS = {"0.0.1", "0.0.2", "0.0.3", "0.1.0"}
 
 
 class WorkflowError(RuntimeError):
@@ -165,26 +171,56 @@ def _nonempty(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def _dispatch_actions(state: dict[str, Any], dispatch_id: str | None) -> list[dict[str, Any]]:
+def _dispatch_actions(
+    state: dict[str, Any],
+    dispatch_id: str | None,
+    supervision_epoch: int | None = None,
+) -> list[dict[str, Any]]:
     if not _nonempty(dispatch_id):
         return []
-    return [item for item in state.get("host_actions", []) if item.get("dispatchId") == dispatch_id]
+    actions = [item for item in state.get("host_actions", []) if item.get("dispatchId") == dispatch_id]
+    if supervision_epoch is not None:
+        actions = [item for item in actions if item.get("supervisionEpoch") == supervision_epoch]
+    return actions
 
 
-def _dispatch_send_action(state: dict[str, Any], dispatch_id: str | None) -> dict[str, Any] | None:
-    return next((item for item in _dispatch_actions(state, dispatch_id) if item.get("action") == "send_message"), None)
+def _dispatch_send_action(
+    state: dict[str, Any], dispatch_id: str | None, supervision_epoch: int | None = None
+) -> dict[str, Any] | None:
+    return next((item for item in reversed(_dispatch_actions(state, dispatch_id, supervision_epoch)) if item.get("action") == "send_message"), None)
 
 
-def _dispatch_wait_action(state: dict[str, Any], dispatch_id: str | None) -> dict[str, Any] | None:
-    return next((item for item in _dispatch_actions(state, dispatch_id) if item.get("action") == "wait_threads"), None)
+def _dispatch_wait_action(
+    state: dict[str, Any], dispatch_id: str | None, supervision_epoch: int | None = None
+) -> dict[str, Any] | None:
+    return next((item for item in reversed(_dispatch_actions(state, dispatch_id, supervision_epoch)) if item.get("action") == "wait_threads"), None)
 
 
-def _dispatch_read_action(state: dict[str, Any], dispatch_id: str | None) -> dict[str, Any] | None:
-    return next((item for item in _dispatch_actions(state, dispatch_id) if item.get("action") == "read_thread"), None)
+def _dispatch_read_action(
+    state: dict[str, Any], dispatch_id: str | None, supervision_epoch: int | None = None
+) -> dict[str, Any] | None:
+    return next((item for item in reversed(_dispatch_actions(state, dispatch_id, supervision_epoch)) if item.get("action") == "read_thread"), None)
 
 
-def _dispatch_review_ready(state: dict[str, Any], dispatch_id: str | None) -> bool:
-    wait = _dispatch_wait_action(state, dispatch_id)
+def _dispatch_delivery_acknowledged(
+    state: dict[str, Any], dispatch_id: str | None, supervision_epoch: int | None
+) -> bool:
+    send = _dispatch_send_action(state, dispatch_id, supervision_epoch)
+    if not send or send.get("status") not in {"sent", "observed"}:
+        return False
+    result = send.get("result")
+    return bool(
+        isinstance(result, dict)
+        and result.get("deliveryAcknowledged") is True
+        and result.get("messageId") == send.get("messageId")
+        and result.get("threadId") == send.get("args", {}).get("threadId")
+    )
+
+
+def _dispatch_review_ready(
+    state: dict[str, Any], dispatch_id: str | None, supervision_epoch: int | None = None
+) -> bool:
+    wait = _dispatch_wait_action(state, dispatch_id, supervision_epoch)
     if wait is None:
         return False
     if wait.get("status") == "observed":
@@ -204,7 +240,7 @@ def _dispatch_review_ready(state: dict[str, Any], dispatch_id: str | None) -> bo
                 return False
         except CoordinationPolicyError:
             return False
-        read = _dispatch_read_action(state, dispatch_id)
+        read = _dispatch_read_action(state, dispatch_id, supervision_epoch)
         return bool(read and read.get("status") == "observed")
     return False
 
@@ -478,6 +514,7 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
         "contract": contract,
         "plan_steps": list(contract.get("plan_steps", [])),
         "destination_ready": False,
+        "bootstrap_packet": None,
         "readiness_receipt": None,
         "destination_id": None,
         "handoff_requested": False,
@@ -497,6 +534,9 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
         "session_deleted": False,
         "session_removed": False,
         "execution_report_ref": None,
+        "execution_reports": [],
+        "report_revision": 0,
+        "report_event_cursor": None,
         "repair_evidence": None,
         "repair_outcome": None,
         "independent_acceptance": False,
@@ -505,9 +545,14 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
         "last_event": None,
         "event_count": 0,
         "host_actions": [],
+        "delivery_acknowledgements": [],
         "migration_steps": [],
         "migration": summarize_migration_steps([]),
         "supervision": None,
+        "supervision_epochs": [],
+        "corrections": [],
+        "delegations": [],
+        "review_binding": None,
         "legacy_compatibility": False,
         "retention_dry_run_done": False,
         "retention_applied": False,
@@ -525,6 +570,7 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
             state["migration_policy_enabled"] = True
         elif event_name == "bootstrap.requested":
             state["status"] = "bootstrap_pending"
+            state["bootstrap_packet"] = payload.get("packet")
         elif event_name == "destination.ready":
             state["status"] = "destination_ready"
             state["destination_ready"] = True
@@ -560,12 +606,52 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
                     updated["status"] = event_name.split(".", 1)[1]
                     updated["result"] = payload.get("result")
                     state["host_actions"][index] = updated
+                    if (
+                        event_name in {"host-action.sent", "host-action.observed"}
+                        and updated.get("action") == "send_message"
+                        and isinstance(updated.get("result"), dict)
+                        and updated["result"].get("deliveryAcknowledged") is True
+                    ):
+                        state["delivery_acknowledgements"].append({
+                            "dispatchId": updated.get("dispatchId"),
+                            "supervisionEpoch": updated.get("supervisionEpoch"),
+                            "messageId": updated.get("messageId"),
+                            "threadId": updated.get("args", {}).get("threadId"),
+                            "actionId": updated.get("actionId"),
+                            "eventCursor": event.get("id"),
+                        })
                     break
         elif event_name == "coordination.migration_step":
             state["migration_steps"].append(payload.get("step", {}))
             state["migration"] = summarize_migration_steps(state["migration_steps"])
         elif event_name == "coordination.supervision_updated":
             state["supervision"] = payload.get("plan")
+            plan = payload.get("plan")
+            if isinstance(plan, dict):
+                replaced = False
+                for index, existing in enumerate(state["supervision_epochs"]):
+                    if (
+                        existing.get("dispatchId") == plan.get("dispatchId")
+                        and existing.get("supervisionEpoch") == plan.get("supervisionEpoch")
+                    ):
+                        state["supervision_epochs"][index] = plan
+                        replaced = True
+                        break
+                if not replaced:
+                    state["supervision_epochs"].append(plan)
+        elif event_name == "coordination.delegation_requested":
+            decision = payload.get("decision")
+            if isinstance(decision, dict):
+                state["delegations"].append(decision)
+        elif event_name == "coordination.delegation_completed":
+            delegation_id = payload.get("delegationId")
+            for index, delegation in enumerate(state["delegations"]):
+                if delegation.get("delegationId") == delegation_id:
+                    updated = dict(delegation)
+                    updated["status"] = "completed"
+                    updated["completionOutput"] = payload.get("output")
+                    state["delegations"][index] = updated
+                    break
         elif event_name in {"source-session.delete_requested", "source-session.removal_requested"}:
             state["source_delete_requested"] = True
             state["source_removal_requested"] = True
@@ -592,18 +678,45 @@ def _state_from_events(events: list[dict[str, Any]], contract: dict[str, Any]) -
         elif event_name == "execution.reported":
             state["status"] = "reviewing"
             state["execution_report_ref"] = payload.get("report_ref")
+            state["report_revision"] = payload.get("reportRevision", state["report_revision"] + 1)
+            state["report_event_cursor"] = event.get("id")
+            state["execution_reports"].append({
+                "revision": state["report_revision"],
+                "baseRevision": payload.get("baseRevision"),
+                "reportRef": payload.get("report_ref"),
+                "eventCursor": event.get("id"),
+                "evidenceDelta": payload.get("evidenceDelta"),
+            })
             state["repair_evidence"] = payload.get("repairEvidence")
             repair_policy = contract.get("repair_policy")
             if repair_policy is not None and state["repair_evidence"] is not None:
                 state["repair_outcome"] = evaluate_repair_evidence(repair_policy, state["repair_evidence"])
         elif event_name == "review.correction_requested":
-            state["status"] = "correction"
+            state["status"] = "executing" if payload.get("correctionId") else "correction"
             state["last_reason"] = payload.get("reason")
             state["checkpoint"] = bool(payload.get("checkpoint", False))
+            if payload.get("correctionId"):
+                state["corrections"].append({
+                    "correctionId": payload.get("correctionId"),
+                    "dispatchId": payload.get("dispatchId"),
+                    "supervisionEpoch": payload.get("supervisionEpoch"),
+                    "reportRevision": payload.get("reportRevision"),
+                    "reportEventCursor": payload.get("reportEventCursor"),
+                    "reason": payload.get("reason"),
+                    "evidenceDelta": payload.get("evidenceDelta"),
+                    "eventCursor": event.get("id"),
+                })
         elif event_name == "review.accepted":
             state["status"] = "accepted"
             state["independent_acceptance"] = bool(payload.get("independent", False))
             state["checkpoint"] = bool(payload.get("checkpoint", False))
+            state["review_binding"] = {
+                "reportRevision": payload.get("reportRevision"),
+                "reportEventCursor": payload.get("reportEventCursor"),
+                "workState": payload.get("workState"),
+                "reviewerId": payload.get("reviewerId"),
+                "eventCursor": event.get("id"),
+            }
         elif event_name == "completion.requested":
             state["status"] = "complete"
         elif event_name == "blocked":
@@ -674,6 +787,14 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
             state["legacy_compatibility"] = True
         if not receipt["ready"]:
             raise WorkflowError("destination receipt is not ready")
+        bootstrap_packet = state.get("bootstrap_packet")
+        if isinstance(bootstrap_packet, dict):
+            if receipt_value.get("role") != bootstrap_packet.get("role"):
+                raise WorkflowError("readiness receipt role does not match bootstrap packet")
+            if receipt_value.get("destinationId") != bootstrap_packet.get("destinationId"):
+                raise WorkflowError("readiness receipt destination does not match bootstrap packet")
+            if receipt_value.get("peerIdentity") != bootstrap_packet.get("peerIdentity"):
+                raise WorkflowError("readiness receipt peer does not match bootstrap packet")
         return
     if event == "handoff.requested":
         if not state.get("destination_ready"):
@@ -793,6 +914,9 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
         if action.get("dispatchId") and action.get("action") in {"send_message", "wait_threads", "read_thread"}:
             if action.get("dispatchId") != (state.get("supervision") or {}).get("dispatchId"):
                 raise WorkflowError("host action dispatchId must match the current dispatch")
+            supervision_epoch = (state.get("supervision") or {}).get("supervisionEpoch")
+            if action.get("supervisionEpoch") != supervision_epoch:
+                raise WorkflowError("host action supervisionEpoch must match the current supervision epoch")
         if any(item.get("actionId") == action.get("actionId") for item in state.get("host_actions", [])):
             raise WorkflowError("host action identity already exists")
         return
@@ -804,12 +928,13 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
         if actor != current.get("actorRole"):
             raise WorkflowError("host-action result actor must match the planned action actorRole")
         dispatch_id = current.get("dispatchId")
+        supervision_epoch = current.get("supervisionEpoch")
         if current.get("action") == "wait_threads":
-            send = _dispatch_send_action(state, dispatch_id)
-            if not send or send.get("status") not in {"sent", "observed"}:
-                raise WorkflowError("wait result requires the same dispatch send action to be sent first")
+            send = _dispatch_send_action(state, dispatch_id, supervision_epoch)
+            if send and not _dispatch_delivery_acknowledged(state, dispatch_id, supervision_epoch):
+                raise WorkflowError("wait result requires same-epoch delivery acknowledgement")
         if current.get("action") == "read_thread":
-            wait = _dispatch_wait_action(state, dispatch_id)
+            wait = _dispatch_wait_action(state, dispatch_id, supervision_epoch)
             if not wait or wait.get("status") != "failed":
                 raise WorkflowError("read fallback requires a failed wait for the same dispatch")
         target_status = event.split(".", 1)[1]
@@ -819,6 +944,7 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
                 target_status,
                 payload.get("result"),
                 allow_legacy_wait_shape=bool(state.get("legacy_compatibility")),
+                allow_legacy_delivery_shape=bool(state.get("legacy_compatibility")),
             )
         except CoordinationPolicyError as exc:
             raise WorkflowError(str(exc)) from exc
@@ -840,15 +966,52 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
             raise WorkflowError("rejected delegation cannot write an event")
         if actor != decision.get("parentRole"):
             raise WorkflowError("delegation event actor must match parent role")
+        if (
+            state.get("contract", {}).get("skill_version") == SKILL_VERSION
+            and decision.get("schemaVersion") != 2
+        ):
+            raise WorkflowError("current-version delegation requires structured ownership")
+        if decision.get("schemaVersion") == 2:
+            required = (
+                "delegationId", "parentAgentId", "childAgentId", "ownershipScopes",
+                "accessMode", "expectedOutput", "dependencies", "aggregatorId",
+            )
+            if any(key not in decision for key in required):
+                raise WorkflowError("structured delegation ownership is incomplete")
+        return
+    if event == "coordination.delegation_completed":
+        delegation_id = payload.get("delegationId")
+        active = next(
+            (
+                item for item in state.get("delegations", [])
+                if item.get("delegationId") == delegation_id and item.get("status") == "active"
+            ),
+            None,
+        )
+        if active is None:
+            raise WorkflowError("delegation completion requires an active delegation")
+        if actor != active.get("parentRole"):
+            raise WorkflowError("delegation completion actor must match parent role")
+        if not _nonempty(payload.get("output")):
+            raise WorkflowError("delegation completion requires output")
         return
     if event == "coordination.supervision_updated":
         plan = payload.get("plan")
-        if not isinstance(plan, dict) or plan.get("schemaVersion") != 1:
+        if not isinstance(plan, dict) or plan.get("schemaVersion") not in {1, 2}:
             raise WorkflowError("supervision update requires a code-backed plan")
         if status not in {"dispatched", "executing", "reviewing", "correction"}:
             raise WorkflowError("supervision update requires an active dispatch")
         if plan.get("failureClass") == "orchestration_harness_failure" and plan.get("writeAllowed") is not False:
             raise WorkflowError("wait failure fallback must remain read-only")
+        if plan.get("schemaVersion") == 2:
+            if plan.get("dispatchId") != (state.get("supervision") or {}).get("dispatchId") and state.get("supervision") is not None:
+                raise WorkflowError("supervision update must remain on the current dispatch")
+            current_epoch = (state.get("supervision") or {}).get("supervisionEpoch", 0)
+            next_epoch = plan.get("supervisionEpoch")
+            if not isinstance(next_epoch, int) or next_epoch < 1 or next_epoch > current_epoch + 1:
+                raise WorkflowError("supervision epoch must be current or next")
+            if next_epoch < current_epoch:
+                raise WorkflowError("supervision epoch cannot move backwards")
         wait_result = plan.get("waitResult")
         if wait_result is not None:
             try:
@@ -869,16 +1032,17 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
             raise WorkflowError("execution must start after dispatch")
         supervision = state.get("supervision")
         dispatch_id = supervision.get("dispatchId") if isinstance(supervision, dict) else None
-        send = _dispatch_send_action(state, dispatch_id)
+        supervision_epoch = supervision.get("supervisionEpoch") if isinstance(supervision, dict) else None
+        send = _dispatch_send_action(state, dispatch_id, supervision_epoch)
         legacy_lifecycle_start = bool(
             _legacy_start_compatibility(state)
             and state.get("last_event") == "dispatch.requested"
             and not state.get("host_actions")
             and not supervision
         )
-        if not send or send.get("status") not in {"sent", "observed"}:
+        if not _dispatch_delivery_acknowledged(state, dispatch_id, supervision_epoch):
             if not legacy_lifecycle_start:
-                raise WorkflowError("execution start requires the current dispatch send action to be sent")
+                raise WorkflowError("execution start requires the current dispatch delivery acknowledgement")
         # Start is unlocked by the same-dispatch management send.  The later
         # wait/read observation remains a review and correction gate, but must
         # not create a circular dependency that prevents execution beginning.
@@ -886,6 +1050,13 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
     if event == "execution.reported":
         if status != "executing" or not _nonempty(payload.get("report_ref")):
             raise WorkflowError("execution report requires executing state and report_ref")
+        supervision = state.get("supervision")
+        if isinstance(supervision, dict):
+            dispatch_id = supervision.get("dispatchId")
+            supervision_epoch = supervision.get("supervisionEpoch")
+            send = _dispatch_send_action(state, dispatch_id, supervision_epoch)
+            if send and not _dispatch_delivery_acknowledged(state, dispatch_id, supervision_epoch):
+                raise WorkflowError("execution report requires current correction delivery acknowledgement")
         repair_policy = state.get("contract", {}).get("repair_policy")
         if repair_policy is not None:
             if payload.get("repairEvidence") is None:
@@ -894,13 +1065,33 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
                 evaluate_repair_evidence(repair_policy, payload["repairEvidence"])
             except RepairPolicyError as exc:
                 raise WorkflowError(str(exc)) from exc
+        if state.get("legacy_compatibility") and payload.get("reportRevision") is None:
+            return
+        expected_revision = state.get("report_revision", 0) + 1
+        if payload.get("reportRevision") != expected_revision:
+            raise WorkflowError("execution report revision is not the next revision")
+        if payload.get("baseRevision") != state.get("report_revision", 0):
+            raise WorkflowError("execution report baseRevision is stale")
+        if payload.get("reportEventCursor") != state.get("event_count", 0) + 1:
+            raise WorkflowError("execution report event cursor is stale")
         return
     if event == "review.correction_requested":
-        if status != "reviewing":
-            raise WorkflowError("correction requires a report under review")
+        if status not in {"executing", "reviewing"}:
+            raise WorkflowError("correction requires active execution or a report under review")
         supervision = state.get("supervision")
-        if not isinstance(supervision, dict) or not _dispatch_review_ready(state, supervision.get("dispatchId")):
+        supervision_epoch = supervision.get("supervisionEpoch") if isinstance(supervision, dict) else None
+        if not isinstance(supervision, dict) or not _dispatch_review_ready(state, supervision.get("dispatchId"), supervision_epoch):
             raise WorkflowError("review requires same-dispatch wait observed or observed read fallback")
+        correction_id = payload.get("correctionId")
+        if correction_id:
+            if any(item.get("correctionId") == correction_id for item in state.get("corrections", [])):
+                raise WorkflowError("correction identity already exists")
+            if payload.get("dispatchId") != supervision.get("dispatchId") or payload.get("supervisionEpoch") != supervision_epoch:
+                raise WorkflowError("correction must bind the observed supervision epoch")
+            if payload.get("reportRevision") != state.get("report_revision", 0):
+                raise WorkflowError("correction report revision is stale")
+            if payload.get("reportEventCursor") != state.get("report_event_cursor"):
+                raise WorkflowError("correction report cursor is stale")
         return
     if event == "review.accepted":
         if status != "reviewing" or not state.get("execution_report_ref"):
@@ -908,8 +1099,20 @@ def _validate_event(state: dict[str, Any], event: str, payload: dict[str, Any], 
         if not payload.get("independent") or payload.get("checkpoint"):
             raise WorkflowError("checkpoint cannot be accepted as final")
         supervision = state.get("supervision")
-        if not isinstance(supervision, dict) or not _dispatch_review_ready(state, supervision.get("dispatchId")):
+        supervision_epoch = supervision.get("supervisionEpoch") if isinstance(supervision, dict) else None
+        if not isinstance(supervision, dict) or not _dispatch_review_ready(state, supervision.get("dispatchId"), supervision_epoch):
             raise WorkflowError("review requires same-dispatch wait observed or observed read fallback")
+        if state.get("legacy_compatibility") and payload.get("reportRevision") is None:
+            return
+        if payload.get("reportRevision") != state.get("report_revision"):
+            raise WorkflowError("review is stale for the current report revision")
+        if payload.get("reportEventCursor") != state.get("report_event_cursor"):
+            raise WorkflowError("review is stale for the current event cursor")
+        if payload.get("workState") != "reviewing":
+            raise WorkflowError("review must bind the reviewing work state")
+        reviewer_id = payload.get("reviewerId")
+        if not _nonempty(reviewer_id) or reviewer_id == state.get("contract", {}).get("execution_peer"):
+            raise WorkflowError("independent review requires a non-execution reviewer identity")
         repair_policy = state.get("contract", {}).get("repair_policy")
         if repair_policy is not None:
             outcome = state.get("repair_outcome")
@@ -1080,8 +1283,33 @@ class WorkflowStore:
         packet = make_bootstrap_packet(destination_role, destination_id, peer_identity, install_source, capability_mode)
         return self._append(task_id, "bootstrap.requested", {"packet": packet}, actor)
 
-    def destination_ready(self, task_id: str, receipt: dict[str, Any], expected_role: str | None = None, expected_destination_id: str | None = None, actor: str = "execution") -> dict[str, Any]:
-        return self._append(task_id, "destination.ready", {"receipt": receipt, "expected_role": expected_role, "expected_destination_id": expected_destination_id}, actor)
+    def destination_ready(
+        self,
+        task_id: str,
+        receipt: dict[str, Any],
+        expected_role: str | None = None,
+        expected_destination_id: str | None = None,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = extract_readiness_receipt(receipt)
+        state = self.state(task_id)
+        packet = state.get("bootstrap_packet") if isinstance(state.get("bootstrap_packet"), dict) else {}
+        derived_role = normalized.get("role")
+        derived_destination = normalized.get("destinationId") or normalized.get("stableSessionId")
+        validation_role = expected_role or packet.get("role") or derived_role
+        validation_destination = expected_destination_id or packet.get("destinationId") or derived_destination
+        validate_readiness_receipt(normalized, validation_role, validation_destination)
+        return self._append(
+            task_id,
+            "destination.ready",
+            {
+                "receipt": normalized,
+                "expected_role": validation_role,
+                "expected_destination_id": validation_destination,
+                "derivedPeerIdentity": normalized.get("peerIdentity"),
+            },
+            actor or derived_role,
+        )
 
     def handoff_request(self, task_id: str, packet: dict[str, Any], actor: str = "management") -> dict[str, Any]:
         return self._append(task_id, "handoff.requested", {"packet": packet}, actor)
@@ -1283,7 +1511,7 @@ class WorkflowStore:
         effective_dispatch_id = dispatch_id or f"{task_id}:dispatch:{state['event_count'] + 1}"
         self._append(task_id, "dispatch.requested", {"dispatchId": effective_dispatch_id, "packet_ref": packet_ref}, actor)
         destination = state.get("destination_id") or self.contract(task_id).get("execution_peer") or "execution"
-        self.update_supervision(task_id, effective_dispatch_id, actor=actor)
+        self.update_supervision(task_id, effective_dispatch_id, supervision_epoch=1, actor=actor)
         action = build_host_action(
             "send_message",
             "codex_app__send_message_to_thread",
@@ -1293,6 +1521,8 @@ class WorkflowStore:
             phase="management_dispatch_send",
             action_id=f"{effective_dispatch_id}:send",
             dispatch_id=effective_dispatch_id,
+            supervision_epoch=1,
+            message_id=f"{effective_dispatch_id}:message:1",
         )
         self.plan_host_action(task_id, action, actor=actor)
         wait = build_host_action(
@@ -1304,6 +1534,7 @@ class WorkflowStore:
             phase="management_dispatch_wait",
             action_id=f"{effective_dispatch_id}:wait",
             dispatch_id=effective_dispatch_id,
+            supervision_epoch=1,
         )
         return self.plan_host_action(task_id, wait, actor=actor)
 
@@ -1332,12 +1563,28 @@ class WorkflowStore:
                 status,
                 result,
                 allow_legacy_wait_shape=bool(state.get("legacy_compatibility")),
+                allow_legacy_delivery_shape=bool(state.get("legacy_compatibility")),
             )
         except CoordinationPolicyError as exc:
             raise WorkflowError(str(exc)) from exc
         event = f"host-action.{status}"
         event_actor = actor if actor is not None else current.get("actorRole")
         snapshot = self._append(task_id, event, {"actionId": action_id, "result": updated.get("result")}, event_actor)
+        if current.get("action") == "wait_threads" and status == "observed":
+            wake = result.get("wake") if isinstance(result, dict) else None
+            progress_cursor = None
+            if isinstance(result, dict) and _nonempty(result.get("progressCursor")):
+                progress_cursor = result.get("progressCursor")
+            elif isinstance(wake, dict) and _nonempty(wake.get("cursor")):
+                progress_cursor = wake.get("cursor")
+            return self.update_supervision(
+                task_id,
+                current.get("dispatchId"),
+                wait_result=result,
+                supervision_epoch=current.get("supervisionEpoch") or 1,
+                progress_cursor=progress_cursor,
+                actor="management",
+            )
         if current.get("action") == "wait_threads" and status == "failed":
             targets = current.get("args", {}).get("targets") or []
             destination = (targets[0].get("threadId") if targets and isinstance(targets[0], dict) else None) or current.get("args", {}).get("threadId")
@@ -1348,8 +1595,9 @@ class WorkflowStore:
                 actor_role="management",
                 target_role="execution",
                 phase="management_dispatch_read_fallback",
-                action_id=f"{current.get('dispatchId')}:read",
+                action_id=f"{current.get('dispatchId')}:epoch:{current.get('supervisionEpoch') or 1}:read",
                 dispatch_id=current.get("dispatchId"),
+                supervision_epoch=current.get("supervisionEpoch") or 1,
             )
             return self.plan_host_action(task_id, fallback, actor="management")
         return snapshot
@@ -1357,13 +1605,54 @@ class WorkflowStore:
     def record_migration_step(self, task_id: str, step: dict[str, Any], actor: str = "management") -> dict[str, Any]:
         return self._append(task_id, "coordination.migration_step", {"step": step}, actor)
 
-    def request_delegation(self, task_id: str, parent_role: str, work_category: str, child_role: str | None = None) -> dict[str, Any]:
-        from coordination_policy import validate_delegation
-
-        decision = validate_delegation(parent_role, work_category, child_role)
+    def request_delegation(
+        self,
+        task_id: str,
+        parent_role: str,
+        work_category: str,
+        child_role: str | None = None,
+        delegation_spec: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if delegation_spec is None:
+            if self.contract(task_id).get("skill_version") == SKILL_VERSION:
+                raise WorkflowError("current-version delegation requires a structured spec")
+            decision = validate_delegation(parent_role, work_category, child_role)
+            if decision["allowed"]:
+                decision = {
+                    **decision,
+                    "schemaVersion": 1,
+                    "ownershipStatus": "LEGACY_UNPROVEN",
+                    "writeScopeEnforced": False,
+                }
+        else:
+            try:
+                decision = build_delegation_contract(
+                    parent_role,
+                    work_category,
+                    child_role or "",
+                    parent_agent_id=delegation_spec.get("parentAgentId"),
+                    child_agent_id=delegation_spec.get("childAgentId"),
+                    ownership_scopes=delegation_spec.get("ownershipScopes", []),
+                    access_mode=delegation_spec.get("accessMode"),
+                    expected_output=delegation_spec.get("expectedOutput"),
+                    dependencies=delegation_spec.get("dependencies", []),
+                    aggregator_id=delegation_spec.get("aggregatorId"),
+                    delegation_id=delegation_spec.get("delegationId"),
+                )
+                validate_delegation_conflicts(decision, self.state(task_id).get("delegations", []))
+            except CoordinationPolicyError as exc:
+                raise WorkflowError(str(exc)) from exc
         if not decision["allowed"] or not decision["require"]["eventWriteAllowed"]:
             raise WorkflowError(decision["require"]["reason"])
         return self._append(task_id, "coordination.delegation_requested", {"decision": decision}, parent_role)
+
+    def complete_delegation(self, task_id: str, delegation_id: str, output: str, actor: str) -> dict[str, Any]:
+        return self._append(
+            task_id,
+            "coordination.delegation_completed",
+            {"delegationId": delegation_id, "output": output},
+            actor,
+        )
 
     def migration_plan(
         self,
@@ -1383,9 +1672,125 @@ class WorkflowStore:
             inheritance_evidence=inheritance_evidence,
         )
 
-    def update_supervision(self, task_id: str, dispatch_id: str, wait_result: dict[str, Any] | None = None, read_result: dict[str, Any] | None = None, actor: str = "management") -> dict[str, Any]:
-        plan = build_supervision_plan(dispatch_id, wait_result, read_result)
+    def update_supervision(
+        self,
+        task_id: str,
+        dispatch_id: str,
+        wait_result: dict[str, Any] | None = None,
+        read_result: dict[str, Any] | None = None,
+        *,
+        supervision_epoch: int | None = None,
+        correction_id: str | None = None,
+        progress_cursor: str | None = None,
+        actor: str = "management",
+    ) -> dict[str, Any]:
+        state = self.state(task_id)
+        current = state.get("supervision") if isinstance(state.get("supervision"), dict) else None
+        epoch = supervision_epoch or (current.get("supervisionEpoch") if current else 1)
+        previous_cursor = None
+        if current and current.get("dispatchId") == dispatch_id:
+            previous_cursor = current.get("progressCursor") or current.get("previousProgressCursor")
+        stagnant_epochs = current.get("stagnantEpochs", 0) if current and current.get("dispatchId") == dispatch_id else 0
+        plan = build_supervision_plan(
+            dispatch_id,
+            wait_result,
+            read_result,
+            supervision_epoch=epoch,
+            correction_id=correction_id or (current.get("correctionId") if current and current.get("supervisionEpoch") == epoch else None),
+            progress_cursor=progress_cursor,
+            previous_progress_cursor=previous_cursor,
+            stagnant_epochs=stagnant_epochs,
+            no_progress_limit=DEFAULT_NO_PROGRESS_LIMIT,
+        )
         return self._append(task_id, "coordination.supervision_updated", {"plan": plan}, actor)
+
+    def advance_supervision(
+        self,
+        task_id: str,
+        dispatch_id: str,
+        *,
+        correction_id: str | None = None,
+        prompt: str | None = None,
+        actor: str = "management",
+    ) -> dict[str, Any]:
+        state = self.state(task_id)
+        current = state.get("supervision")
+        if not isinstance(current, dict) or current.get("dispatchId") != dispatch_id:
+            raise WorkflowError("supervision advance requires the current dispatch")
+        current_epoch = current.get("supervisionEpoch", 1)
+        if not _dispatch_review_ready(state, dispatch_id, current_epoch):
+            raise WorkflowError("supervision advance requires an observed current epoch")
+        next_epoch = current_epoch + 1
+        self.update_supervision(
+            task_id,
+            dispatch_id,
+            supervision_epoch=next_epoch,
+            correction_id=correction_id,
+            actor=actor,
+        )
+        destination = state.get("destination_id") or self.contract(task_id).get("execution_peer") or "execution"
+        if prompt is not None:
+            send = build_host_action(
+                "send_message",
+                "codex_app__send_message_to_thread",
+                {"threadId": destination, "prompt": prompt},
+                actor_role="management",
+                target_role="execution",
+                phase="management_correction_send",
+                action_id=f"{dispatch_id}:epoch:{next_epoch}:send",
+                dispatch_id=dispatch_id,
+                supervision_epoch=next_epoch,
+                message_id=f"{dispatch_id}:message:{next_epoch}",
+                correction_id=correction_id,
+            )
+            self.plan_host_action(task_id, send, actor=actor)
+        wait = build_host_action(
+            "wait_threads",
+            "codex_app__wait_threads",
+            {"targets": [{"threadId": destination}], "timeoutMs": DEFAULT_WAIT_TIMEOUT_MS},
+            actor_role="management",
+            target_role="execution",
+            phase="management_supervision_wait",
+            action_id=f"{dispatch_id}:epoch:{next_epoch}:wait",
+            dispatch_id=dispatch_id,
+            supervision_epoch=next_epoch,
+            correction_id=correction_id,
+        )
+        return self.plan_host_action(task_id, wait, actor=actor)
+
+    def request_correction(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        correction_id: str | None = None,
+        evidence_delta: dict[str, Any] | None = None,
+        checkpoint: bool = False,
+        actor: str = "management",
+    ) -> dict[str, Any]:
+        state = self.state(task_id)
+        supervision = state.get("supervision")
+        if not isinstance(supervision, dict):
+            raise WorkflowError("correction requires active supervision")
+        resolved_id = correction_id or f"{task_id}:correction:{len(state.get('corrections', [])) + 1}"
+        payload = {
+            "reason": reason or "correction requested",
+            "checkpoint": checkpoint,
+            "correctionId": resolved_id,
+            "dispatchId": supervision.get("dispatchId"),
+            "supervisionEpoch": supervision.get("supervisionEpoch"),
+            "reportRevision": state.get("report_revision", 0),
+            "reportEventCursor": state.get("report_event_cursor"),
+            "evidenceDelta": redact_json(evidence_delta or {}),
+        }
+        self._append(task_id, "review.correction_requested", payload, actor)
+        return self.advance_supervision(
+            task_id,
+            supervision.get("dispatchId"),
+            correction_id=resolved_id,
+            prompt=payload["reason"],
+            actor=actor,
+        )
 
     def coordination_policy(self) -> dict[str, Any]:
         return coordination_policy_projection()
@@ -1399,6 +1804,7 @@ class WorkflowStore:
         report_ref: str | None = None,
         report_text: str | None = None,
         repair_evidence: dict[str, Any] | None = None,
+        evidence_delta: dict[str, Any] | None = None,
         actor: str = "execution",
     ) -> dict[str, Any]:
         if report_text and not report_ref:
@@ -1410,16 +1816,49 @@ class WorkflowStore:
         if not report_ref:
             raise WorkflowError("report requires report_ref or report_text")
         _validate_ref(self.root / report_ref, self.root)
-        payload: dict[str, Any] = {"report_ref": report_ref}
+        state = self.state(task_id)
+        payload: dict[str, Any] = {
+            "report_ref": report_ref,
+            "reportRevision": state.get("report_revision", 0) + 1,
+            "baseRevision": state.get("report_revision", 0),
+            "reportEventCursor": state.get("event_count", 0) + 1,
+            "evidenceDelta": redact_json(evidence_delta or {}),
+        }
         if repair_evidence is not None:
             payload["repairEvidence"] = redact_json(repair_evidence)
         return self._append(task_id, "execution.reported", payload, actor)
 
-    def review(self, task_id: str, decision: str, actor: str = "management", independent: bool = False, checkpoint: bool = False, reason: str | None = None) -> dict[str, Any]:
+    def review(
+        self,
+        task_id: str,
+        decision: str,
+        actor: str = "management",
+        independent: bool = False,
+        checkpoint: bool = False,
+        reason: str | None = None,
+        reviewer_id: str | None = None,
+        correction_id: str | None = None,
+        evidence_delta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if decision == "accepted":
-            return self._append(task_id, "review.accepted", {"independent": independent, "checkpoint": checkpoint}, actor)
+            state = self.state(task_id)
+            return self._append(task_id, "review.accepted", {
+                "independent": independent,
+                "checkpoint": checkpoint,
+                "reportRevision": state.get("report_revision"),
+                "reportEventCursor": state.get("report_event_cursor"),
+                "workState": state.get("status"),
+                "reviewerId": reviewer_id or actor,
+            }, actor)
         if decision == "correction":
-            return self._append(task_id, "review.correction_requested", {"reason": reason or "correction requested", "checkpoint": checkpoint}, actor)
+            return self.request_correction(
+                task_id,
+                reason or "correction requested",
+                correction_id=correction_id,
+                evidence_delta=evidence_delta,
+                checkpoint=checkpoint,
+                actor=actor,
+            )
         if decision == "blocked":
             return self._append(task_id, "blocked", {"reason": reason or "blocked"}, actor)
         raise WorkflowError("unknown review decision")
@@ -1489,9 +1928,18 @@ class WorkflowStore:
             "retention_dry_run_done": False,
             "retention_applied": False,
             "host_actions": [],
+            "delivery_acknowledgements": [],
             "migration_steps": [],
             "migration": summarize_migration_steps([]),
             "supervision": None,
+            "supervision_epochs": [],
+            "corrections": [],
+            "delegations": [],
+            "execution_reports": [],
+            "report_revision": 0,
+            "report_event_cursor": None,
+            "review_binding": None,
+            "bootstrap_packet": None,
             "legacy_compatibility": False,
             "contract": self.contract(task_id),
         }
@@ -1526,6 +1974,12 @@ class WorkflowStore:
             "migrationSteps": state.get("migration_steps", []),
             "migration": state.get("migration", summarize_migration_steps([])),
             "supervision": state.get("supervision"),
+            "supervisionEpochs": state.get("supervision_epochs", []),
+            "deliveryAcknowledgements": state.get("delivery_acknowledgements", []),
+            "corrections": state.get("corrections", []),
+            "delegations": state.get("delegations", []),
+            "executionReports": state.get("execution_reports", []),
+            "reviewBinding": state.get("review_binding"),
             "legacyCompatibility": state.get("legacy_compatibility", False),
             "coordinationPolicy": coordination_policy_projection(),
             "repairPolicy": repair_policy_projection(),
@@ -1640,32 +2094,38 @@ def next_action(snapshot: dict[str, Any], capability_inventory: Any | None = Non
         supervision = snapshot.get("supervision")
         if isinstance(supervision, dict):
             dispatch_id = supervision.get("dispatchId")
-            send = _dispatch_send_action(snapshot, dispatch_id)
+            supervision_epoch = supervision.get("supervisionEpoch")
+            send = _dispatch_send_action(snapshot, dispatch_id, supervision_epoch)
             if send and send.get("status") == "planned":
                 return {
                     "action": "send_dispatch_host_action",
                     "dispatchId": dispatch_id,
+                    "supervisionEpoch": supervision_epoch,
                     "hostAction": send,
                     "writeAllowed": True,
                 }
             if send and send.get("status") == "failed":
                 return {"action": "stop", "reason": "dispatch send failed", "dispatchId": dispatch_id}
             if send and send.get("status") in {"sent", "observed"}:
-                return {"action": "start_execution", "dispatchId": dispatch_id}
-            wait = _dispatch_wait_action(snapshot, dispatch_id)
+                if not _dispatch_delivery_acknowledged(snapshot, dispatch_id, supervision_epoch):
+                    return {"action": "stop", "reason": "dispatch delivery acknowledgement missing", "dispatchId": dispatch_id}
+                return {"action": "start_execution", "dispatchId": dispatch_id, "supervisionEpoch": supervision_epoch}
+            wait = _dispatch_wait_action(snapshot, dispatch_id, supervision_epoch)
             if wait and wait.get("status") == "planned":
                 return {
                     "action": "wait_dispatch_host_action",
                     "dispatchId": dispatch_id,
+                    "supervisionEpoch": supervision_epoch,
                     "hostAction": wait,
                     "writeAllowed": False,
                 }
             if wait and wait.get("status") == "failed":
-                read = _dispatch_read_action(snapshot, dispatch_id)
+                read = _dispatch_read_action(snapshot, dispatch_id, supervision_epoch)
                 if read and read.get("status") == "planned":
                     return {
                         "action": "read_dispatch_fallback",
                         "dispatchId": dispatch_id,
+                        "supervisionEpoch": supervision_epoch,
                         "hostAction": read,
                         "writeAllowed": False,
                     }
@@ -1674,6 +2134,7 @@ def next_action(snapshot: dict[str, Any], capability_inventory: Any | None = Non
             return {
                 "action": "supervise_dispatch",
                 "dispatchId": dispatch_id,
+                "supervisionEpoch": supervision_epoch,
                 "nextAction": supervision.get("nextAction"),
                 "sequence": supervision.get("sequence", ["wait", "observe", "correct"]),
                 "failureClass": supervision.get("failureClass"),
@@ -1684,25 +2145,51 @@ def next_action(snapshot: dict[str, Any], capability_inventory: Any | None = Non
         supervision = snapshot.get("supervision")
         if isinstance(supervision, dict):
             dispatch_id = supervision.get("dispatchId")
-            wait = _dispatch_wait_action(snapshot, dispatch_id)
+            supervision_epoch = supervision.get("supervisionEpoch")
+            send = _dispatch_send_action(snapshot, dispatch_id, supervision_epoch)
+            if send and send.get("status") == "planned":
+                return {
+                    "action": "send_correction_host_action",
+                    "dispatchId": dispatch_id,
+                    "supervisionEpoch": supervision_epoch,
+                    "correctionId": supervision.get("correctionId"),
+                    "hostAction": send,
+                    "writeAllowed": True,
+                }
+            if send and send.get("status") == "failed":
+                return {"action": "stop", "reason": "correction send failed", "dispatchId": dispatch_id, "supervisionEpoch": supervision_epoch}
+            if send and not _dispatch_delivery_acknowledged(snapshot, dispatch_id, supervision_epoch):
+                return {"action": "stop", "reason": "correction delivery acknowledgement missing", "dispatchId": dispatch_id, "supervisionEpoch": supervision_epoch}
+            wait = _dispatch_wait_action(snapshot, dispatch_id, supervision_epoch)
             if wait and wait.get("status") == "planned":
                 return {
                     "action": "wait_dispatch_host_action",
                     "dispatchId": dispatch_id,
+                    "supervisionEpoch": supervision_epoch,
                     "hostAction": wait,
                     "writeAllowed": False,
                 }
             if wait and wait.get("status") == "failed":
-                read = _dispatch_read_action(snapshot, dispatch_id)
+                read = _dispatch_read_action(snapshot, dispatch_id, supervision_epoch)
                 if read and read.get("status") == "planned":
                     return {
                         "action": "read_dispatch_fallback",
                         "dispatchId": dispatch_id,
+                        "supervisionEpoch": supervision_epoch,
                         "hostAction": read,
                         "writeAllowed": False,
                     }
                 if not read or read.get("status") != "observed":
                     return {"action": "stop", "reason": "wait failed without observed read fallback", "dispatchId": dispatch_id}
+            if supervision.get("nextAction") == "request_progress_diagnosis":
+                return {
+                    "action": "request_progress_diagnosis",
+                    "dispatchId": dispatch_id,
+                    "supervisionEpoch": supervision_epoch,
+                    "target": "same_execution",
+                    "createReplacementSession": False,
+                    "request": supervision.get("escalation", {}).get("request"),
+                }
         if status == "executing":
             return {"action": "submit_execution_report"}
         return {"action": "independent_review"}
@@ -1873,6 +2360,7 @@ def quick_validate() -> dict[str, Any]:
         "projectless_target_schema": False,
         "coordination_projection": False,
         "coordination_wait_timeout": False,
+        "coordination_epoch_and_delivery": False,
     }
     try:
         validate_create_target({"type": "project", "projectId": "quick-validate", "environment": {"type": "local"}})
@@ -1882,6 +2370,10 @@ def quick_validate() -> dict[str, Any]:
         projection = coordination_policy_projection()
         checks["coordination_projection"] = bool(projection.get("hostActionSchemas"))
         checks["coordination_wait_timeout"] = projection.get("defaultWaitTimeoutMs", 0) > 0
+        checks["coordination_epoch_and_delivery"] = (
+            projection.get("supervisionEpochs") is True
+            and projection.get("deliveryAcknowledgement") == ["dispatchId", "messageId", "threadId"]
+        )
     except CoordinationPolicyError:
         pass
     return {"ok": all(checks.values()), "checks": checks, "skillVersion": SKILL_VERSION, "externalReadsRequired": False}
@@ -1952,6 +2444,58 @@ def run_selftest() -> dict[str, Any]:
     checks["coordination_wait_timeout_continue"] = timeout_plan["nextAction"] == "wait" and timeout_plan["reviewReady"] is False and timeout_plan["failureClass"] is None
     checks["coordination_wait_turn_completed"] = turn_plan["nextAction"] == "observe" and turn_plan["reviewReady"] is True
     checks["coordination_delegation_gate"] = validate_delegation("management", "implementation", "execution")["require"]["eventWriteAllowed"] is False
+    stagnant_plan = build_supervision_plan(
+        "dispatch",
+        {"timedOut": False, "wake": {"reason": "turnCompleted"}},
+        supervision_epoch=4,
+        progress_cursor="same",
+        previous_progress_cursor="same",
+        stagnant_epochs=2,
+    )
+    checks["coordination_no_progress_same_execution"] = (
+        stagnant_plan["nextAction"] == "request_progress_diagnosis"
+        and stagnant_plan["escalation"]["target"] == "same_execution"
+        and stagnant_plan["escalation"]["createReplacementSession"] is False
+    )
+    settings_proof = derive_execution_settings(
+        {"locale": "zh-CN"},
+        {"locale": "en-US"},
+        inheritance_evidence={
+            "proven": True,
+            "readOnly": True,
+            "source": "host-settings-read",
+            "destinationId": "execution",
+            "observedSettings": {"locale": "en-US"},
+        },
+    )
+    checks["coordination_settings_read_only"] = settings_proof["evidenceProven"] and settings_proof["mutationAllowed"] is False
+    first_delegation = build_delegation_contract(
+        "execution",
+        "parallel_implementation",
+        "execution",
+        parent_agent_id="execution-parent",
+        child_agent_id="execution-child-1",
+        ownership_scopes=["module/import"],
+        access_mode="implementation",
+        expected_output="tested change",
+        dependencies=[],
+        aggregator_id="execution-parent",
+        delegation_id="delegation-1",
+    )
+    second_delegation = build_delegation_contract(
+        "execution",
+        "parallel_implementation",
+        "execution",
+        parent_agent_id="execution-parent",
+        child_agent_id="execution-child-2",
+        ownership_scopes=["module/export"],
+        access_mode="implementation",
+        expected_output="tested change",
+        dependencies=[],
+        aggregator_id="execution-parent",
+        delegation_id="delegation-2",
+    )
+    checks["coordination_delegation_ownership"] = validate_delegation_conflicts(second_delegation, [first_delegation])["ok"] is True
     with tempfile.TemporaryDirectory(prefix="uaw-selftest-") as temp:
         project = Path(temp) / "project"
         project.mkdir()
@@ -1977,7 +2521,7 @@ def run_selftest() -> dict[str, Any]:
             "capabilityMode": "native",
             "destinationId": "dest-1",
             "stableSessionId": "session-1",
-            "peerIdentity": "execution",
+            "peerIdentity": "management",
             "runtimeAuthority": "code-state",
             "externalReadsRequired": False,
             "validationSource": "destination-bootstrap",
@@ -1986,13 +2530,26 @@ def run_selftest() -> dict[str, Any]:
             "policyRuleCount": 1,
             "ready": True,
         }
+        receipt_wrapper = {
+            "ok": True,
+            "command": "destination-bootstrap",
+            "receipt": receipt,
+            "externalReadsRequired": False,
+        }
+        checks["coordination_receipt_direct_pipe"] = extract_readiness_receipt(receipt_wrapper) == receipt
         store.destination_ready("demo", receipt, expected_role="execution", expected_destination_id="dest-1")
         store.dispatch("demo")
         dispatch_state = store.state("demo")
         dispatch_id = dispatch_state["supervision"]["dispatchId"]
         send_action = _dispatch_send_action(dispatch_state, dispatch_id)
         wait_action = _dispatch_wait_action(dispatch_state, dispatch_id)
-        store.record_host_action_result("demo", send_action["actionId"], "sent", {"ok": True, "messageId": "selftest-send"})
+        delivered_state = store.record_host_action_result("demo", send_action["actionId"], "sent", {
+            "ok": True,
+            "deliveryAcknowledged": True,
+            "messageId": send_action["messageId"],
+            "threadId": send_action["args"]["threadId"],
+        })
+        checks["coordination_delivery_acknowledged"] = len(delivered_state.get("delivery_acknowledgements", [])) == 1
         store.record_host_action_result("demo", wait_action["actionId"], "observed", {"ok": True, "observed": True})
         store.start_execution("demo")
         store.report("demo", report_ref="reports/demo.md")
@@ -2002,6 +2559,7 @@ def run_selftest() -> dict[str, Any]:
         except WorkflowError:
             checks["checkpoint_not_final"] = True
         store.review("demo", "accepted", independent=True)
+        checks["coordination_review_freshness"] = store.state("demo").get("review_binding", {}).get("reportRevision") == 1
         store.complete("demo")
         checks["lifecycle_complete"] = store.state("demo")["status"] == "complete"
         checks["audit"] = store.audit("demo")["ok"]
