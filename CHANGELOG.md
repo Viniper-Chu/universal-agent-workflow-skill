@@ -1,5 +1,15 @@
 # Changelog
 
+## Astra Workflow 0.1.0 (2026-09-05)
+
+- Added a standalone, lightweight `packages/astra-workflow` skill for GPT-6
+  Astra, with optional local-work and handoff references.
+- Added a Chinese AGENTS template and a rule-by-rule audit explaining removals,
+  retained safeguards, and the distinction between output retention and Git history.
+- Made Astra the recommended README entry for new ordinary tasks. Kept the
+  governed UAW 0.2.0 runtime and package unchanged for existing consumers.
+- This is an independent skill version, not a change to the engine receipt version.
+
 ## 0.2.0
 
 - Added delivery acknowledgements that atomically bind dispatch, message, and

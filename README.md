@@ -1,5 +1,38 @@
 # Universal Agent Workflow
 
+## GPT-6 Astra: recommended lightweight workflow
+
+For ordinary new tasks, use **[Astra Workflow](packages/astra-workflow/SKILL.md)**.
+It carries authorized work through implementation, focused verification, and
+delivery without initializing a state machine. It is a community workflow
+designed for GPT-6 Astra, not an official OpenAI package or a model switch.
+
+日常任务直接执行；文件操作和跨会话交接按需展开。具体取舍见
+[中文审查说明](docs/astra-audit-2026-09-05.md)，项目规则可参考
+[精简 AGENTS 模板](examples/AGENTS.minimal.md)。
+
+| Package | Version | When to use |
+|---|---|---|
+| `packages/astra-workflow` | 0.1.0 | New tasks needing lightweight execution or continuity |
+| `packages/universal-agent-workflow` | 0.2.0 | Existing governed contracts or explicitly requested formal coordination |
+
+Install only the package you need. To install Astra, copy
+`packages/astra-workflow` as `astra-workflow` into your host's skills directory
+(for Codex, `$CODEX_HOME/skills`, normally `~/.codex/skills`). There are no runtime
+dependencies for Astra. Then invoke `$astra-workflow` in a task. Do not copy the
+whole repository into a single skill folder or overwrite an existing different
+installation without inspecting it first.
+
+Existing UAW contracts keep their original engine, version, and acceptance
+rules. Do not load both workflows for an ordinary task. The root `VERSION` and
+Python project metadata below continue to describe the 0.2.0 engine; the new
+Astra package has its own `VERSION`.
+
+## Legacy 0.2.0 engine (opt-in)
+
+The rest of this README documents the governed engine only. Its commands and
+receipt requirements are not prerequisites for using Astra Workflow.
+
 Universal Agent Workflow is a small, standard-library-only Skill and workflow
 engine for governed management/execution collaboration. It keeps a task
 contract and JSONL event log as the state authority, then renders status,

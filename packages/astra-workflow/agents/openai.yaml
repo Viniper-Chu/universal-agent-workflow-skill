@@ -1,0 +1,4 @@
+interface:
+  display_name: "Astra Workflow"
+  short_description: "Lightweight execution, verification, and handoff"
+  default_prompt: "Use $astra-workflow to complete this task with focused verification and only the coordination it needs."
